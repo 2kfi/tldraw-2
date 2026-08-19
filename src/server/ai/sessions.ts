@@ -72,21 +72,25 @@ async function* withTimeout<T>(
 	ms: number,
 	signal?: AbortSignal
 ): AsyncGenerator<T> {
+	let timedOutTimer: NodeJS.Timeout | null = null
 	const timedOut = new Promise<never>((_, reject) => {
-		setTimeout(() => reject(new Error('Agent run timed out')), ms)
+		timedOutTimer = setTimeout(() => reject(new Error('Agent run timed out')), ms)
 	})
+	const abortHandler = () => { throw new Error('Agent run aborted') }
 	const aborted = new Promise<never>((_, reject) => {
-		signal?.addEventListener('abort', () => reject(new Error('Agent run aborted')), { once: true })
+		signal?.addEventListener('abort', abortHandler, { once: true })
 	})
-	try {
-		while (true) {
-			const result = await Promise.race([source.next(), timedOut, aborted])
-			if (result.done) break
-			yield result.value
-		}
-	} finally {
-		await (source as any).return?.()
+try {
+	while (true) {
+		const result = await Promise.race([source.next(), timedOut, aborted])
+		if (result.done) break
+		yield result.value
 	}
+} finally {
+	if (timedOutTimer) clearTimeout(timedOutTimer)
+	if (signal) signal.removeEventListener('abort', abortHandler)
+	await (source as any).return?.()
+}
 }
 
 // ============================================================================
@@ -202,6 +206,7 @@ export class AiSession {
 	private helpers: AgentHelpers | null = null
 	private running = false
 	private stop = false
+	private stopRequested = false
 	private runAbort: AbortController | null = null
 	private loadedResolve: (() => void) | null = null
 	private streamingTimer: NodeJS.Timeout | null = null
@@ -256,7 +261,13 @@ export class AiSession {
 	 * error, so the reset here is what users observe. */
 	cancel() {
 		this.runAbort?.abort()
+		this.stopRequested = true
 		this.running = false
+		if (this.streamingTimer) {
+			clearTimeout(this.streamingTimer)
+			this.streamingTimer = null
+		}
+		this.pendingStreamingText = ''
 		const cur = this.getAiState()
 		if (cur && (cur.status === 'pending' || cur.status === 'running')) {
 			this.putAiState({
@@ -301,7 +312,12 @@ export class AiSession {
 		})
 		this.client = client
 		this.syncStore = store
-		await loaded
+		await Promise.race([
+			loaded,
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error('TLSyncClient failed to load within 15s')), 15_000)
+			),
+		])
 		if (!store.get(AI_STATE_ID as any)) {
 			store.put([createDefaultAiState()] as any)
 		}
@@ -461,6 +477,9 @@ export class AiSession {
 		this.runAbort = new AbortController()
 		let assistantText = ''
 		try {
+			// Check if a cancel was requested during the pending->running window
+			if (this.stopRequested) return
+			this.stopRequested = false
 			this.putAiState({ ...start, status: 'running', streamingText: '', error: null })
 			const prompt = this.buildPrompt(start, this.resolveModel(start.promptModel))
 			const events = withTimeout(this.service.stream(prompt), RUN_TIMEOUT_MS, this.runAbort.signal)
@@ -475,7 +494,7 @@ export class AiSession {
 				if (!util) continue
 				try {
 					const sanitized = util.sanitizeAction(event, this.helpers!)
-					if (sanitized) await util.applyAction(sanitized, this.helpers!)
+					if (sanitized) await util.applyAction(sanitized, this.helpers!, this.runAbort.signal)
 				} catch (error) {
 					console.error(`[ai] room ${this.roomId} failed to apply ${event._type}`, error)
 				}

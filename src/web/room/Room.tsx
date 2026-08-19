@@ -54,12 +54,16 @@ function RoomChrome({
   onToggleMusic,
   aiOpen,
   onToggleAi,
+  panelsOpen,
+  isSynced,
 }: {
   roomId: string
   musicOpen: boolean
   onToggleMusic: () => void
   aiOpen: boolean
   onToggleAi: () => void
+  panelsOpen: boolean
+  isSynced: boolean
 }) {
   const editor = useEditor()
   const [claimOpen, setClaimOpen] = useState(false)
@@ -117,14 +121,29 @@ function RoomChrome({
   function importBoard(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
-    if (!window.confirm('Importing replaces the current board. Continue?')) {
+    const msg = isSynced
+      ? 'Importing a snapshot will replace all room content including AI history and music queue. Continue?'
+      : 'Importing replaces the current board. Continue?'
+    if (!window.confirm(msg)) {
       e.target.value = ''
       return
     }
     file
       .text()
       .then((text) => {
-        editor.loadSnapshot(JSON.parse(text))
+        const snapshot = JSON.parse(text)
+        const tryLoad = () => {
+          try {
+            editor.loadSnapshot(snapshot)
+          } catch (err) {
+            if (err instanceof Error && err.message.includes('not ready')) {
+              setTimeout(tryLoad, 100)
+            } else {
+              throw err
+            }
+          }
+        }
+        tryLoad()
       })
       .catch((err) => {
         window.alert(`Import failed: ${err instanceof Error ? err.message : 'invalid file'}`)
@@ -133,7 +152,7 @@ function RoomChrome({
   }
 
   return (
-    <div className="room-chrome">
+    <div className={`room-chrome${panelsOpen ? ' panels-open' : ''}`}>
       {isHost ? (
         <span className="room-badge">You're the host</span>
       ) : claimOpen ? (
@@ -206,10 +225,14 @@ export function Room({ roomId }: { roomId: string }) {
   const [known, setKnown] = useState<boolean | null>(null)
   useEffect(() => {
     let cancelled = false
-    api<{ id: string }>(`/api/rooms/${roomId}`).then(
-      () => !cancelled && setKnown(true),
-      () => !cancelled && setKnown(false),
-    )
+    api<{ id: string }>(`/api/rooms/${roomId}`)
+      .then(() => !cancelled && setKnown(true))
+      .catch((err) => {
+        if (!cancelled) {
+          if (err?.status === 404) setKnown(false)
+          else setKnown(null)
+        }
+      })
     return () => {
       cancelled = true
     }
@@ -276,17 +299,19 @@ function RoomConnected({ roomId, user }: { roomId: string; user: { id: string; n
     )
   }
 
-  return <RoomCanvas roomId={roomId} user={user} store={store.store} />
+  return <RoomCanvas roomId={roomId} user={user} store={store.store} isSynced={store.status === 'synced-remote'} />
 }
 
 function RoomCanvas({
   roomId,
   user,
   store,
+  isSynced,
 }: {
   roomId: string
   user: { id: string; name: string; color: string }
   store: TLStore
+  isSynced: boolean
 }) {
   const [editor, setEditor] = useState<Editor | null>(null)
   const isCompact = useIsCompact()
@@ -330,6 +355,11 @@ function RoomCanvas({
     [store, user.id]
   )
 
+  const InFrontOfTheCanvas = useMemo(
+    () => () => <CanvasComments {...commenting} />,
+    [commenting]
+  )
+
   // The editor already breaks follow on pan/zoom/wheel; a plain canvas click
   // does not, so do it here (matches the plan's "clicking canvas breaks follow").
   useEffect(() => {
@@ -359,7 +389,7 @@ function RoomCanvas({
             overrides={[commentToolOverrides]}
             components={{
               Toolbar: ToolbarWithComments,
-              InFrontOfTheCanvas: () => <CanvasComments {...commenting} />,
+              InFrontOfTheCanvas,
             }}
           >
             <RoomChrome
@@ -368,6 +398,8 @@ function RoomCanvas({
               onToggleMusic={toggleMusic}
               aiOpen={aiOpen}
               onToggleAi={toggleAi}
+              panelsOpen={aiOpen || musicOpen}
+              isSynced={isSynced}
             />
           </Tldraw>
         </div>

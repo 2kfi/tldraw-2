@@ -136,7 +136,12 @@ export class AgentService {
 
 		// Prefill the assistant turn to force the JSON start, where the model allows it.
 		// Opus 4.7+ and Sonnet 4.6 reject last-assistant-turn prefills (400), so skip it there.
-		if (modelDefinition.supportsPrefill) {
+		// Only anthropic/google providers accept a prefill the parse buffer can rely on;
+		// OpenAI continues mid-JSON and never re-emits the prefix, so it must start empty.
+		const canForceResponseStart =
+			(provider === 'anthropic.messages' || provider === 'google.generative-ai') &&
+			modelDefinition.supportsPrefill
+		if (canForceResponseStart) {
 			messages.push({
 				role: 'assistant',
 				content: '{"actions": [{"_type":',
@@ -160,10 +165,7 @@ export class AgentService {
 				},
 			})
 
-			const canForceResponseStart =
-				(provider === 'anthropic.messages' || provider === 'google.generative-ai') &&
-				modelDefinition.supportsPrefill
-			let buffer = canForceResponseStart ? '{"actions": [{"_type":' : ''
+			let buffer = ''
 			let cursor = 0
 			let maybeIncompleteAction: AgentAction | null = null
 
@@ -179,18 +181,18 @@ export class AgentService {
 
 				// If the events list is ahead of the cursor, we know we've completed the current event
 				// We can complete the event and move the cursor forward
-				if (actions.length > cursor) {
-					const action = actions[cursor - 1] as AgentAction
-					if (action) {
-						yield {
-							...action,
-							complete: true,
-							time: Date.now() - startTime,
-						}
-						maybeIncompleteAction = null
+while (actions.length > cursor) {
+				const action = actions[cursor] as AgentAction
+				if (action) {
+					yield {
+						...action,
+						complete: true,
+						time: Date.now() - startTime,
 					}
-					cursor++
+					maybeIncompleteAction = null
 				}
+				cursor++
+			}
 
 				// Now let's check the (potentially new) current event
 				// And let's yield it in its (potentially incomplete) state

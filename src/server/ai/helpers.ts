@@ -263,9 +263,9 @@ export class AgentHelpers {
 
 		const { editor } = this.agent
 		// Defensively strip the prefix in case the model incorrectly includes it
+		let newId = id.startsWith('shape:') ? (id.slice(6) as SimpleShapeId) : id
 
 		// Ensure the id is unique by incrementing a number at the end
-		let newId = id
 		let existingShape = editor.getShape(`shape:${newId}` as TLShapeId)
 		while (existingShape) {
 			newId = /^.*(\d+)$/.exec(newId)?.[1]

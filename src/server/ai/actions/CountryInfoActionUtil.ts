@@ -2,6 +2,7 @@ import { JsonValue } from 'tldraw'
 import { CountryInfoAction } from '../../../shared/agent/schema/AgentActionSchemas'
 import { Streaming } from '../../../shared/agent/types/Streaming'
 import { AgentActionUtil, registerActionUtil } from './AgentActionUtil'
+import { AgentHelpers } from '../helpers'
 
 export const CountryInfoActionUtil = registerActionUtil(
 	class CountryInfoActionUtil extends AgentActionUtil<CountryInfoAction> {
@@ -17,17 +18,17 @@ export const CountryInfoActionUtil = registerActionUtil(
 			}
 		}
 
-		override async applyAction(action: Streaming<CountryInfoAction>) {
+		override async applyAction(action: Streaming<CountryInfoAction>, _helpers: AgentHelpers, signal?: AbortSignal) {
 			// Wait until the action has finished streaming
 			if (!action.complete) return
-			const data = await fetchCountryInfo(action.code)
+			const data = await fetchCountryInfo(action.code, signal)
 			this.agent.schedule({ data: [data] })
 		}
 	}
 )
 
-export async function fetchCountryInfo(code: string) {
-	const response = await fetch(`https://restcountries.com/v3.1/alpha/${code}`)
+export async function fetchCountryInfo(code: string, signal?: AbortSignal) {
+	const response = await fetch(`https://restcountries.com/v3.1/alpha/${code}`, { signal })
 
 	if (!response.ok) {
 		throw new Error(`Country API returned status ${response.status}, ${response.statusText}`)

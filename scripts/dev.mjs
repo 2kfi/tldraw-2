@@ -8,7 +8,7 @@ if (first.status !== 0) process.exit(first.status ?? 1)
 
 const children = [
   spawn('npx', ['tsup', '--watch'], { stdio: 'inherit', cwd: root }),
-  spawn('node', ['--watch', 'dist/server/index.js'], { stdio: 'inherit', cwd: root, env }),
+  spawn('node', ['--env-file-if-exists=.env', '--watch', 'dist/server/index.js'], { stdio: 'inherit', cwd: root, env }),
   spawn('npx', ['vite'], { stdio: 'inherit', cwd: root }),
 ]
 

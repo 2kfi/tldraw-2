@@ -71,9 +71,11 @@ export function MusicPanel({
   }
 
   useEffect(() => {
+    let cancelled = false
     api<MusicTracksResponse>('/api/music')
-      .then((res) => setTracks(res.tracks))
-      .catch(() => setTracks([]))
+      .then((res) => { if (!cancelled) setTracks(res.tracks) })
+      .catch(() => { if (!cancelled) setTracks([]) })
+    return () => { cancelled = true }
   }, [])
 
   useEffect(() => {
@@ -123,7 +125,7 @@ export function MusicPanel({
       if (!joined) return // awaiting a gesture — the Join playback button shows
       if (!seekingRef.current) {
         if (Math.abs(audio.currentTime - pos) > 0.35 && Number.isFinite(audio.duration)) audio.currentTime = pos
-        if (audio.paused) audio.play().catch(() => setPlaybackError('Playback failed — click any track, then press play.'))
+        if (audio.paused) audio.play().catch(() => { setPlaybackError('Playback failed — click any track, then press play.'); write({ playing: false }) })
       }
     } else {
       audio.pause()
@@ -138,8 +140,9 @@ export function MusicPanel({
 
   function playTrack(trackId: string) {
     setPlaybackError(null)
+    setJoined(true)
     const cur = getMusic() ?? createDefaultMusicState(me.id)
-    const queue = cur.queue.length ? cur.queue : tracks.map((t) => t.id)
+    const queue = cur.queue.length ? [...cur.queue] : tracks.map((t) => t.id)
     if (!queue.includes(trackId)) queue.push(trackId)
     putMusic({ ...cur, currentTrackId: trackId, queue, playing: true, startedAt: Date.now(), positionMs: 0, updatedBy: me.id })
   }
@@ -185,20 +188,19 @@ export function MusicPanel({
     }
   }
 
-  async function refresh() {
+  function refresh() {
     const token = getHostToken(roomId)
     if (!token) return
     setRefreshError(null)
-    try {
-      await api<MusicTracksResponse>('/api/music/refresh', {
-        method: 'POST',
-        headers: { 'X-Host-Token': token },
-      })
-      const res = await api<MusicTracksResponse>('/api/music')
-      setTracks(res.tracks)
-    } catch (err) {
-      setRefreshError(err instanceof Error ? err.message : 'refresh failed')
-    }
+    const cancelledRef = { current: false }
+    api<MusicTracksResponse>('/api/music/refresh', {
+      method: 'POST',
+      headers: { 'X-Host-Token': token },
+    })
+      .then(() => api<MusicTracksResponse>('/api/music'))
+      .then((res) => { if (!cancelledRef.current) setTracks(res.tracks) })
+      .catch((err) => { if (!cancelledRef.current) setRefreshError(err instanceof Error ? err.message : 'refresh failed') })
+    return () => { cancelledRef.current = true }
   }
 
   function toggleDJ(rawUserId: string) {
@@ -350,6 +352,15 @@ export function MusicPanel({
           const a = audioRef.current
           const m = getMusic()
           if (a && m && joinedRef.current && Number.isFinite(a.duration)) a.currentTime = currentPos(m) / 1000
+        }}
+        onEnded={() => {
+          const m = getMusic()
+          if (!m?.currentTrackId) return
+          const queue = m.queue.length ? m.queue : tracks.map((t) => t.id)
+          const idx = queue.indexOf(m.currentTrackId)
+          if (queue.length === 0 || idx < 0) return
+          const next = queue[(idx + 1) % queue.length]
+          if (next) playTrack(next)
         }}
       />
     </aside>

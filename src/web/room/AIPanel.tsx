@@ -11,7 +11,7 @@ import { getAiContext } from './aiContext'
 import { usePanelSlide } from '../lib/usePanelSlide'
 
 const MODEL_KEY = 't2.aiModel'
-const DEFAULT_MODEL = 'gpt-5.4-mini'
+const DEFAULT_MODEL = 'claude-sonnet-4-6'
 
 export function AIPanel({
   roomId,
@@ -39,13 +39,17 @@ export function AIPanel({
   const chatRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    let cancelled = false
     api<AiModelsResponse>('/api/ai/models')
       .then((res) => {
-        const ids = res.models.map((m) => m.id)
-        setModels(ids)
-        setModel((prev) => prev || ids[0] || DEFAULT_MODEL)
+        if (!cancelled) {
+          const ids = res.models.map((m) => m.id)
+          setModels(ids)
+          setModel((prev) => (ids.includes(prev) ? prev : ids[0] || DEFAULT_MODEL))
+        }
       })
-      .catch(() => setModels([]))
+      .catch(() => { if (!cancelled) setModels([]) })
+    return () => { cancelled = true }
   }, [])
 
   useEffect(() => {
@@ -91,10 +95,14 @@ export function AIPanel({
     setInput('')
   }
 
-  function stop() {
-    api(`/api/rooms/${roomId}/ai/cancel`, { method: 'POST' }).catch(() => {})
-    const cur = getAi()
-    if (cur) putAi({ ...cur, status: 'idle', error: null, streamingText: '', lockedBy: null, lockedByName: null })
+  async function stop() {
+    try {
+      await api(`/api/rooms/${roomId}/ai/cancel`, { method: 'POST' })
+      const cur = getAi()
+      if (cur) putAi({ ...cur, status: 'idle', error: null, streamingText: '', lockedBy: null, lockedByName: null })
+    } catch (error) {
+      console.error('[ai] cancel request failed:', error)
+    }
   }
 
   function clearConversation() {
@@ -127,19 +135,15 @@ export function AIPanel({
           </span>
         </div>
         <div className="ai-panel-sub">
-          <input
-            list="ai-models"
+          <select
             className="ai-input ai-model"
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            placeholder="Model (e.g. gpt-5.4-mini)"
-            spellCheck={false}
-          />
-          <datalist id="ai-models">
+          >
             {models.map((id) => (
-              <option key={id} value={id} />
+              <option key={id} value={id}>{id}</option>
             ))}
-          </datalist>
+          </select>
         </div>
       </div>
 
@@ -182,6 +186,7 @@ export function AIPanel({
                 submit()
               }
             }}
+            enterKeyHint="send"
           />
           {running ? (
             <button className="ai-send ai-stop" onClick={stop} disabled={!running}>

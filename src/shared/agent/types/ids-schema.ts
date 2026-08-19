@@ -13,7 +13,7 @@ export function toTldrawShapeId(id: SimpleShapeId): TldrawShapeId {
 }
 
 export function toSimpleShapeId(id: string): SimpleShapeId {
-	if (id.startsWith('shape:')) throw new Error('Invalid simple shape id')
+	if (id.startsWith('shape:')) id = id.slice(6)
 	return id as SimpleShapeId
 }
 

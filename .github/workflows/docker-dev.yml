@@ -3,6 +3,7 @@ name: build and push dev image
 on:
   push:
     branches: [dev]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -11,6 +12,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Verify Docker Hub secrets
         env:
@@ -29,9 +32,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Extract version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION=${{ github.ref_name }}
+          else
+            VERSION=dev
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: idkarkan/tl-image-dev:v0.2
+          tags: |
+            idkarkan/tl-image-dev:${{ steps.version.outputs.version }}
+            idkarkan/tl-image-dev:latest

@@ -20,6 +20,11 @@ Open http://localhost:3000 — create a room, share the link.
 > docker compose up` (or change `ports:` in docker-compose.yml) — the server
 > reads `PORT`; only the compose `ports:` mapping needs the edit for Docker.
 > The server prints a clear error and exits if the chosen port is busy.
+>
+> **Port summary:**
+> - **Dev (`npm run dev`)**: Vite on :3000 → proxies `/api`, `/sync`, `/media` to server on :3001
+> - **Standalone (`npm start`)**: Server on :3000 (serves built web + API), no proxy
+> - **Docker**: Server on :3000 (container port 3000 mapped to host), no proxy
 
 Development:
 
@@ -28,6 +33,10 @@ npm install
 npm run dev               # tsup watch + node --watch server + vite on :3000 (proxies to :3001)
 npm run build             # tsup (dist/server, dist/shared, dist/ai) + vite (dist/web)
 ```
+
+`.env` is auto-loaded by both `npm run dev` and `npm start` (Node's
+`--env-file-if-exists`), so `cp .env.example .env` is all local dev needs.
+Variables already set in the shell take precedence over `.env`.
 
 ## Architecture
 

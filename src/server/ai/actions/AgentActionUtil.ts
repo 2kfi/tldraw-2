@@ -149,7 +149,7 @@ export abstract class AgentActionUtil<T extends BaseAgentAction = BaseAgentActio
 	 * Apply the action to the editor.
 	 * Any changes that happen during this function will be displayed as a diff.
 	 */
-	applyAction(_action: Streaming<T>, _helpers: AgentHelpers): Promise<void> | void {
+	applyAction(_action: Streaming<T>, _helpers: AgentHelpers, _signal?: AbortSignal): Promise<void> | void {
 		// Do nothing by default
 	}
 

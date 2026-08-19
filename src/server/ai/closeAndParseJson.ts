@@ -14,8 +14,11 @@ export function closeAndParseJson(string: string) {
 		const lastOpening = stackOfOpenings.at(-1)
 
 		if (char === '"') {
-			// Check if this quote is escaped
-			if (i > 0 && string[i - 1] === '\\') {
+			// Check if this quote is escaped. Count consecutive preceding
+			// backslashes: odd = escaped quote, even = backslashes escaped each other.
+			let backslashes = 0
+			for (let j = i - 1; j >= 0 && string[j] === '\\'; j--) backslashes++
+			if (backslashes % 2 === 1) {
 				// This is an escaped quote, skip it
 				i++
 				continue

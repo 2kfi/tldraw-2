@@ -74,6 +74,11 @@ export const PenActionUtil = registerActionUtil(
 				points.push(...pointsToAdd)
 			}
 
+			// Open strokes must include their final point
+			if (!action.closed) {
+				points.push(action.points[action.points.length - 1]!)
+			}
+
 			// Require at least 2 points to draw a line
 			if (points.length <= 1) {
 				return

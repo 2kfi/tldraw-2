@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import gsap from 'gsap'
 
 // Slide a docked panel in/out. Side decides the slide direction (left panels
@@ -10,15 +10,15 @@ export function usePanelSlide(
   side: 'left' | 'right',
   open: boolean
 ) {
-  const first = useRef(true)
   const dir = side === 'left' ? -100 : 100
+  const initialized = useRef(new WeakSet<HTMLDivElement>())
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    if (first.current) {
-      first.current = false
+    if (!initialized.current.has(el)) {
+      initialized.current.add(el)
       gsap.set(el, { autoAlpha: open ? 1 : 0, xPercent: reduced ? 0 : open ? 0 : dir })
       return
     }

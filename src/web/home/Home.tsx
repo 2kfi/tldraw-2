@@ -28,7 +28,10 @@ export function Home() {
   }
 
   useEffect(() => {
-    refreshBoards().catch(() => setBoards([]))
+    let cancelled = false
+    refreshBoards()
+      .catch(() => { if (!cancelled) setBoards([]) })
+    return () => { cancelled = true }
   }, [])
 
   async function createRoom() {
@@ -49,8 +52,11 @@ export function Home() {
 
   function joinRoom(e: React.FormEvent) {
     e.preventDefault()
-    const id = joinId.trim()
-    if (id) window.location.hash = `/r/${id}`
+    const value = joinId.trim()
+    if (!value) return
+    const match = value.match(/\/r\/([a-z0-9]+)/i)
+    const id = match ? match[1] : value
+    window.location.hash = `/r/${id}`
   }
 
   async function rename(board: MyBoard) {
