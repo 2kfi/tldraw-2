@@ -1,6 +1,6 @@
 {
   "name": "tldraw-2",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "tsup && vite build",
-    "start": "node dist/server/index.js",
+    "start": "node --env-file-if-exists=.env dist/server/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
