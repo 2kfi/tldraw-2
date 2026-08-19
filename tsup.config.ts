@@ -11,6 +11,15 @@ export default defineConfig([
     clean: true,
     sourcemap: true,
     external: [
+      // ponytail: keep every @tldraw/* on the single node_modules copy —
+      // inlining transitive ones (editor/store/state/utils/state-react) while
+      // `tldraw` stays external makes the process load them twice
+      '@tldraw/editor',
+      '@tldraw/store',
+      '@tldraw/state',
+      '@tldraw/utils',
+      '@tldraw/state-react',
+      '@tldraw/mentions',
       'better-sqlite3',
       'express',
       'ws',
@@ -37,6 +46,14 @@ export default defineConfig([
     bundle: true,
     clean: false,
     sourcemap: false,
+    external: [
+      '@tldraw/editor',
+      '@tldraw/store',
+      '@tldraw/state',
+      '@tldraw/utils',
+      '@tldraw/state-react',
+      '@tldraw/mentions',
+    ],
   },
   {
     // ponytail: vendored agent kit (prompt builders, action utils, helpers)
@@ -50,6 +67,12 @@ export default defineConfig([
     clean: false,
     sourcemap: false,
     external: [
+      '@tldraw/editor',
+      '@tldraw/store',
+      '@tldraw/state',
+      '@tldraw/utils',
+      '@tldraw/state-react',
+      '@tldraw/mentions',
       'ai',
       '@ai-sdk/openai',
       '@ai-sdk/anthropic',
