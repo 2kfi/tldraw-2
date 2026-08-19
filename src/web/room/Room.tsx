@@ -239,6 +239,13 @@ export function Room({ roomId }: { roomId: string }) {
 }
 
 function RoomConnected({ roomId, user }: { roomId: string; user: { id: string; name: string; color: string } }) {
+  // useSync's effect depends on the `users` object identity: a fresh atom each
+  // render made the sync client re-create its store on every setState, causing
+  // an endless reconnect storm (new storeId per WS attempt). Keep both stable.
+  const currentUser = useMemo(
+    () => atom('currentUser', UserRecordType.create({ id: createUserId(user.id), name: user.name, color: user.color })),
+    [user.id, user.name, user.color]
+  )
   const store = useSync({
     schema,
     // tldraw's useSync runs `new URL(uri)` with no base — a relative path
@@ -246,9 +253,7 @@ function RoomConnected({ roomId, user }: { roomId: string; user: { id: string; n
     // passed) and the socket never opens. Resolve to an absolute URL first.
     uri: useMemo(() => new URL(`/sync/${roomId}`, window.location.href).toString(), [roomId]),
     assets: assetStore,
-    users: {
-      currentUser: atom('currentUser', UserRecordType.create({ id: createUserId(user.id), name: user.name, color: user.color })),
-    },
+    users: useMemo(() => ({ currentUser }), [currentUser]),
   })
 
   if (store.status === 'loading') {
@@ -342,11 +347,14 @@ function RoomCanvas({
     <div className="room">
       <div className="room-layout">
         {isCompact && (aiOpen || musicOpen) && <div className="panel-backdrop" onClick={closePanels} />}
-        {editor && <AIPanel editor={editor} open={aiOpen} onClose={() => setAiOpen(false)} />}
+        {editor && <AIPanel editor={editor} roomId={roomId} open={aiOpen} onClose={() => setAiOpen(false)} />}
         <div className="room-canvas">
           <Tldraw
             store={store}
-            onMount={setEditor}
+            onMount={(ed) => {
+              ed.user.updateUserPreferences({ colorScheme: 'dark' })
+              setEditor(ed)
+            }}
             tools={[CommentTool]}
             overrides={[commentToolOverrides]}
             components={{

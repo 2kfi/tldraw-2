@@ -154,6 +154,13 @@ app.use(createRoomsRouter(db, userFromReq))
 app.use(createAssetsRouter(db))
 app.use(createMusicRouter(db))
 
+// User-facing AI cancel: aborts the in-flight provider stream and releases the
+// room's AI lock. Idempotent — unknown/empty rooms just return ok.
+app.post('/api/rooms/:id/ai/cancel', (req, res) => {
+  sessions.cancelSession(req.params.id)
+  res.json({ ok: true })
+})
+
 const webDist = path.resolve(import.meta.dirname, '../web')
 app.use(express.static(webDist))
 

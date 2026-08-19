@@ -14,10 +14,12 @@ const MODEL_KEY = 't2.aiModel'
 const DEFAULT_MODEL = 'gpt-5.4-mini'
 
 export function AIPanel({
+  roomId,
   editor,
   open,
   onClose,
 }: {
+  roomId: string
   editor: Editor
   open: boolean
   onClose: () => void
@@ -56,7 +58,9 @@ export function AIPanel({
 
   useEffect(() => {
     const el = chatRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) el.scrollTop = el.scrollHeight
   }, [aiState?.conversation, aiState?.streamingText])
 
   const conversation = aiState?.conversation ?? []
@@ -85,6 +89,12 @@ export function AIPanel({
       promptViewport: ctx.viewport,
     })
     setInput('')
+  }
+
+  function stop() {
+    api(`/api/rooms/${roomId}/ai/cancel`, { method: 'POST' }).catch(() => {})
+    const cur = getAi()
+    if (cur) putAi({ ...cur, status: 'idle', error: null, streamingText: '', lockedBy: null, lockedByName: null })
   }
 
   function clearConversation() {
@@ -173,9 +183,15 @@ export function AIPanel({
               }
             }}
           />
-          <button className="ai-send" onClick={submit} disabled={!canSubmit || !input.trim()}>
-            Send
-          </button>
+          {running ? (
+            <button className="ai-send ai-stop" onClick={stop} disabled={!running}>
+              Stop
+            </button>
+          ) : (
+            <button className="ai-send" onClick={submit} disabled={!canSubmit || !input.trim()}>
+              Send
+            </button>
+          )}
         </div>
       </div>
     </aside>

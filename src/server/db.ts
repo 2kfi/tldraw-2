@@ -7,6 +7,8 @@ export const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), 'data')
 export function getDb(): Database.Database {
   mkdirSync(DATA_DIR, { recursive: true })
   const db = new Database(path.join(DATA_DIR, 'tldraw.db'))
+  db.pragma('journal_mode = WAL')
+  db.pragma('busy_timeout = 5000')
   db.exec(`
     CREATE TABLE IF NOT EXISTS rooms (
       id TEXT PRIMARY KEY,

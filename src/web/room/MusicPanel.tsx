@@ -47,6 +47,7 @@ export function MusicPanel({
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [drag, setDrag] = useState<number | null>(null)
+  const [playbackError, setPlaybackError] = useState<string | null>(null)
 
   const audioRef = useRef<HTMLAudioElement>(null)
   const discRef = useRef<HTMLDivElement>(null)
@@ -95,7 +96,7 @@ export function MusicPanel({
     if (!el) return
     const ctx = gsap.context(() => {
       if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
-      tweenRef.current = gsap.to(el, { rotation: '+=360', duration: 8, ease: 'none', repeat: -1, paused: true })
+      tweenRef.current = gsap.to(el, { rotation: 360, duration: 8, ease: 'none', repeat: -1, paused: true })
     })
     return () => ctx.revert()
   }, [])
@@ -103,8 +104,10 @@ export function MusicPanel({
   useEffect(() => {
     const tween = tweenRef.current
     if (!tween) return
-    if (music?.playing && joined) tween.play()
-    else tween.pause()
+    if (music?.playing && joined) {
+      tween.restart()
+      tween.play()
+    } else tween.pause()
   }, [music?.playing, joined])
 
   // keep the <audio> engine matching the synced record
@@ -120,7 +123,7 @@ export function MusicPanel({
       if (!joined) return // awaiting a gesture — the Join playback button shows
       if (!seekingRef.current) {
         if (Math.abs(audio.currentTime - pos) > 0.35 && Number.isFinite(audio.duration)) audio.currentTime = pos
-        if (audio.paused) audio.play().catch(() => {})
+        if (audio.paused) audio.play().catch(() => setPlaybackError('Playback failed — click any track, then press play.'))
       }
     } else {
       audio.pause()
@@ -134,6 +137,7 @@ export function MusicPanel({
   }
 
   function playTrack(trackId: string) {
+    setPlaybackError(null)
     const cur = getMusic() ?? createDefaultMusicState(me.id)
     const queue = cur.queue.length ? cur.queue : tracks.map((t) => t.id)
     if (!queue.includes(trackId)) queue.push(trackId)
@@ -141,6 +145,7 @@ export function MusicPanel({
   }
 
   function togglePlay() {
+    setPlaybackError(null)
     const cur = getMusic()
     if (!cur) return
     if (cur.playing) {
@@ -151,6 +156,7 @@ export function MusicPanel({
   }
 
   function step(delta: number) {
+    setPlaybackError(null)
     const cur = getMusic()
     if (!cur?.currentTrackId) return
     const queue = cur.queue.length ? cur.queue : tracks.map((t) => t.id)
@@ -173,7 +179,10 @@ export function MusicPanel({
     const t = Number(value)
     setDrag(null)
     seekingRef.current = false
-    if (Number.isFinite(t)) seekTo(t * 1000)
+    if (Number.isFinite(t)) {
+      seekTo(t * 1000)
+      setProgress(t)
+    }
   }
 
   async function refresh() {
@@ -229,7 +238,7 @@ export function MusicPanel({
           <div className="music-disc" ref={discRef}>
             <div
               className="music-disc-art"
-              style={current?.artUrl ? { backgroundImage: `url(${current.artUrl})` } : undefined}
+              style={current?.artUrl ? { backgroundImage: `url(${current.artUrl})` } : { background: 'linear-gradient(135deg, #3a3a3a, #1f1f1f)' }}
             />
             <div className="music-disc-label" />
           </div>
@@ -330,6 +339,7 @@ export function MusicPanel({
             )}
           </div>
         </div>
+        {playbackError && <div className="music-status-error">{playbackError}</div>}
         {refreshError && <div className="music-status-error">{refreshError}</div>}
       </div>
 

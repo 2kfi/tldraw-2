@@ -53,6 +53,15 @@ function sleep(ms: number) {
 	return new Promise((r) => setTimeout(r, ms))
 }
 
+function readableError(e: unknown): string {
+	if (e instanceof Error) return e.message
+	// Some providers (AI SDK error rethrow) surface the raw error body as a
+	// plain object like { error: { error: { message } } }.
+	const anyErr = e as { error?: { error?: { message?: unknown }; message?: unknown }; message?: unknown }
+	const m = anyErr?.error?.error?.message ?? anyErr?.error?.message ?? anyErr?.message
+	return typeof m === 'string' ? m : String(e)
+}
+
 /**
  * Bounds an async generator to a wall-clock timeout (created once, so it's a
  * total-run deadline, not a per-event idle). `source.return()` in finally gives
@@ -239,6 +248,29 @@ export class AiSession {
 			this.client?.close()
 		} catch {
 			// best-effort
+		}
+	}
+
+	/** User-facing cancel: stop the in-flight run and release the lock. The
+	 * runPrompt catch sees the aborted signal and returns without writing an
+	 * error, so the reset here is what users observe. */
+	cancel() {
+		this.runAbort?.abort()
+		this.running = false
+		const cur = this.getAiState()
+		if (cur && (cur.status === 'pending' || cur.status === 'running')) {
+			this.putAiState({
+				...cur,
+				status: 'idle',
+				streamingText: '',
+				error: null,
+				lockedBy: null,
+				lockedByName: null,
+				prompt: null,
+				promptModel: null,
+				promptSelection: null,
+				promptViewport: null,
+			})
 		}
 	}
 
@@ -482,7 +514,7 @@ export class AiSession {
 				...cur,
 				status: 'error',
 				streamingText: '',
-				error: error instanceof Error ? error.message : String(error),
+				error: readableError(error),
 				lockedBy: null,
 				lockedByName: null,
 			})
@@ -522,6 +554,11 @@ export class SessionManager {
 			session.destroy()
 			this.sessions.delete(roomId)
 		}
+	}
+
+	/** Idempotent user-facing cancel: no-ops if the room has no live session. */
+	cancelSession(roomId: string) {
+		this.sessions.get(roomId)?.cancel()
 	}
 
 	stop() {

@@ -9,6 +9,7 @@ import { LanguageModel, ModelMessage, streamText } from 'ai'
 import {
 	AgentModelDefinition,
 	AgentModelName,
+	AgentModelProvider,
 	getAgentModelDefinition,
 	isValidModelName,
 } from '../../shared/agent/models'
@@ -32,8 +33,14 @@ export class AgentService {
 	openai: OpenAIProvider
 	anthropic: AnthropicProvider
 	google: GoogleGenerativeAIProvider
+	private readonly configured: Record<AgentModelProvider, boolean>
 
 	constructor(config: AgentServiceConfig) {
+		this.configured = {
+			openai: !!config.openaiApiKey,
+			anthropic: !!config.anthropicApiKey,
+			google: !!config.googleApiKey,
+		}
 		// ponytail: createOpenAI's baseURL accepts any OpenAI-compatible endpoint
 		// (OPENAI_BASE_URL); the plan relies on this to work against proxies.
 		this.openai = createOpenAI({
@@ -47,6 +54,19 @@ export class AgentService {
 	getModel(modelName: AgentModelName): LanguageModel {
 		const modelDefinition = getAgentModelDefinition(modelName)
 		const provider = modelDefinition.provider
+		// Surface a missing key as a clear setup error (surfaces as the AI's
+		// error banner) instead of an opaque upstream 401 auth failure.
+		if (!this.configured[provider]) {
+			const envVar =
+				provider === 'openai'
+					? 'OPENAI_API_KEY'
+					: provider === 'anthropic'
+						? 'ANTHROPIC_API_KEY'
+						: 'GOOGLE_API_KEY'
+			throw new Error(
+				`No ${envVar} configured for model "${modelDefinition.id}" — set the key in the server environment.`
+			)
+		}
 		return this[provider](modelDefinition.id)
 	}
 
