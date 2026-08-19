@@ -200,9 +200,51 @@ export function Room({ roomId }: { roomId: string }) {
   syncUserCookie()
 
   const user = getUser()
+
+  // A stale shared link (room row deleted / fresh data volume) would otherwise
+  // hit the phantom-room gate and retry forever under the "Connecting…" spinner.
+  const [known, setKnown] = useState<boolean | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    api<{ id: string }>(`/api/rooms/${roomId}`).then(
+      () => !cancelled && setKnown(true),
+      () => !cancelled && setKnown(false),
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [roomId])
+
+  if (known === false) {
+    return (
+      <div className="room-status">
+        <p className="room-error">Room not found — it may have been removed, or the link is stale.</p>
+        <a className="room-retry" href="#/">
+          Create a new board
+        </a>
+      </div>
+    )
+  }
+
+  if (known === null) {
+    return (
+      <div className="room-status">
+        <div className="room-spinner" />
+        <p className="room-muted">Checking room…</p>
+      </div>
+    )
+  }
+
+  return <RoomConnected roomId={roomId} user={user} />
+}
+
+function RoomConnected({ roomId, user }: { roomId: string; user: { id: string; name: string; color: string } }) {
   const store = useSync({
     schema,
-    uri: `/sync/${roomId}`,
+    // tldraw's useSync runs `new URL(uri)` with no base — a relative path
+    // throws in browsers (Node resolves it, which is why the spikes always
+    // passed) and the socket never opens. Resolve to an absolute URL first.
+    uri: useMemo(() => new URL(`/sync/${roomId}`, window.location.href).toString(), [roomId]),
     assets: assetStore,
     users: {
       currentUser: atom('currentUser', UserRecordType.create({ id: createUserId(user.id), name: user.name, color: user.color })),
