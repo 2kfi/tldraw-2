@@ -34,4 +34,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: idkarkan/tl-image-dev:v0.1
+          tags: idkarkan/tl-image-dev:v0.2
