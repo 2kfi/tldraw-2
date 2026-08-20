@@ -4,8 +4,9 @@ import path from 'node:path'
 import { WebSocketServer } from 'ws'
 import Database from 'better-sqlite3'
 import { DATA_DIR, getDb } from './db'
+import { log } from './log'
 import { createAssetsRouter } from './assets'
-import { createRoomsRouter } from './rooms'
+import { createRoomsRouter, requireJoinToken } from './rooms'
 import { createMusicRouter } from './music'
 import { scanMusicDir } from './music/scanner'
 import { RoomManager } from './sync'
@@ -14,6 +15,7 @@ import { SessionManager } from './ai/sessions'
 import { AGENT_MODEL_DEFINITIONS, isValidModelName } from '../shared/agent/models'
 import type { AgentModelProvider } from '../shared/agent/models'
 import type { UserInfo } from '../shared/types'
+import type { AiModelInfo } from '../shared/types'
 
 const PORT = Number(process.env.PORT ?? 3000)
 const app = express()
@@ -30,9 +32,7 @@ try {
   db = getDb()
 } catch (err) {
   // A locked/unwritable DB must fail loudly at boot, not mid-request.
-  console.error(
-    `failed to open database at ${DATA_DIR}: ${err instanceof Error ? err.message : err}`
-  )
+  log.error(`failed to open database at ${DATA_DIR}: ${err instanceof Error ? err.message : err}`)
   process.exit(1)
 }
 const service = new AgentService({
@@ -50,6 +50,15 @@ const rooms = new RoomManager(db, {
 const wss = new WebSocketServer({ noServer: true })
 
 const ANON: UserInfo = { id: 'anon', name: 'Guest', color: '#3182ed' }
+
+function readCookie(cookieHeader: string | undefined, name: string): string | undefined {
+  if (typeof cookieHeader !== 'string') return undefined
+  for (const part of cookieHeader.split(';')) {
+    const [key, ...rest] = part.trim().split('=')
+    if (key === name) return decodeURIComponent(rest.join('='))
+  }
+  return undefined
+}
 
 // Browsers can't set WS headers, so the web client sends identity as a cookie.
 // Node spike scripts use x-user-* headers instead.
@@ -90,10 +99,21 @@ wss.on('connection', (socket, req) => {
   // typo'd or hostile id must not materialize a phantom room, its sync tables,
   // or a headless AI session — and this is what surfaces as the "room not
   // found" error in the client.
-  const known = db.prepare('SELECT 1 FROM rooms WHERE id = ?').get(roomId)
+  const known = db.prepare('SELECT password_hash FROM rooms WHERE id = ?').get(roomId) as
+    | { password_hash: string | null }
+    | undefined
   if (!known) {
     socket.close(1008, 'room not found')
     return
+  }
+
+  // Password-protected rooms require a valid join token for THIS room (the
+  // t2join cookie set by POST /api/rooms/:id/join). Public rooms need none.
+  if (known.password_hash) {
+    if (!requireJoinToken(roomId, readCookie(req.headers.cookie, 't2join'))) {
+      socket.close(1008, 'access denied')
+      return
+    }
   }
 
   rooms.handleConnect(roomId, socket, userFromReq(req))
@@ -140,6 +160,27 @@ app.get('/api/ai/models', (_req, res) => {
   res.json({ models })
 })
 
+// Models each configured provider actually serves, fetched live at request
+// time and merged with the static definitions (which keep their tuned options).
+// Best-effort: a failed provider fetch falls back to the static defs with
+// liveFailed:true instead of 500ing, and live-only entries carry known:false.
+app.get('/api/ai/models/live', async (_req, res) => {
+  const { models: live, liveFailed } = await service.listLiveModels()
+  const configured: Record<AgentModelProvider, boolean> = {
+    openai: !!process.env.OPENAI_API_KEY,
+    anthropic: !!process.env.ANTHROPIC_API_KEY,
+    google: !!process.env.GOOGLE_API_KEY,
+  }
+  const byId = new Map<string, AiModelInfo>()
+  for (const [id, def] of Object.entries(AGENT_MODEL_DEFINITIONS)) {
+    if (configured[def.provider]) byId.set(id, { id, name: def.name, provider: def.provider, known: true })
+  }
+  for (const m of live) {
+    if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.id, provider: m.provider, known: false })
+  }
+  res.json({ models: [...byId.values()], liveFailed })
+})
+
 app.use(express.json())
 // malformed JSON bodies (express's json parse throws before zod sees the body)
 // must 400 with clean JSON, not express's default HTML stack-trace page
@@ -168,11 +209,11 @@ app.use(express.static(webDist))
 // client (and so /api/music never races a partially-completed scan).
 // A scan failure must not block boot — music is optional.
 scanMusicDir(db)
-  .then((r) => console.log(`music scan: ${r.tracks.length} track(s) (${r.added} new, ${r.removed} removed)`))
-  .catch((err) => console.error('music scan failed', err))
+  .then((r) => log.info(`music scan: ${r.tracks.length} track(s) (${r.added} new, ${r.removed} removed)`))
+  .catch((err) => log.error('music scan failed', err))
   .finally(() => {
     server.listen(PORT, () => {
-      console.log(`listening on :${PORT}`)
+      log.info(`listening on :${PORT}`)
     })
   })
 
@@ -180,7 +221,7 @@ scanMusicDir(db)
 // :3000 conflict documented in the README) instead of an unhandled error event.
 server.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`port :${PORT} is already in use — set PORT to a free port (see README)`)
+    log.error(`port :${PORT} is already in use — set PORT to a free port (see README)`)
     process.exit(1)
   }
   throw err

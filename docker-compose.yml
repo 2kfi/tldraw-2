@@ -10,6 +10,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - SESSION_SECRET=${SESSION_SECRET:-dev-secret-change-me}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       - DATA_DIR=/data
     volumes:
       - ./data:/data

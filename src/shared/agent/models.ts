@@ -1,4 +1,6 @@
-export type AgentModelName = keyof typeof AGENT_MODEL_DEFINITIONS
+// `(string & {})` keeps literal autocomplete for the static keys while allowing
+// ids discovered at request time from a configured provider's live model list.
+export type AgentModelName = keyof typeof AGENT_MODEL_DEFINITIONS | (string & {})
 export type AgentModelProvider = 'openai' | 'anthropic' | 'google'
 
 /** Adaptive-thinking mode passed to the Anthropic provider. */
@@ -137,13 +139,52 @@ export const AGENT_MODEL_DEFINITIONS = {
 	},
 } as const
 
+// Live-only models discovered at request time by GET /api/ai/models/live. A
+// mutable supplement — instead of expanding the static table — keeps ids the
+// provider actually serves runnable with safe defaults; a wrong tuned option
+// baked into the static table (temperature on Opus, thinkingLevel on non-Gemini-3)
+// would 400 at run time.
+const liveModels = new Map<string, AgentModelDefinition>()
+
+export function registerLiveModel(id: string, provider: AgentModelProvider): void {
+	if (id in AGENT_MODEL_DEFINITIONS || liveModels.has(id)) return
+	if (provider === 'openai') {
+		liveModels.set(id, {
+			name: id,
+			id,
+			provider,
+			supportsPrefill: false,
+			supportsTemperature: true,
+			reasoningEffort: 'none',
+		})
+	} else if (provider === 'google') {
+		liveModels.set(id, {
+			name: id,
+			id,
+			provider,
+			supportsPrefill: true,
+			supportsTemperature: true,
+			thinkingLevel: 'minimal',
+		})
+	} else {
+		liveModels.set(id, {
+			name: id,
+			id,
+			provider,
+			supportsPrefill: false,
+			supportsTemperature: true,
+			thinking: 'disabled',
+		})
+	}
+}
+
 export const DEFAULT_MODEL_NAME: AgentModelName = 'claude-sonnet-4-6'
 
 /**
  * Check if a string is a valid AgentModelName.
  */
 export function isValidModelName(value: string | undefined): value is AgentModelName {
-	return !!value && value in AGENT_MODEL_DEFINITIONS
+	return !!value && (value in AGENT_MODEL_DEFINITIONS || liveModels.has(value))
 }
 
 /**
@@ -152,7 +193,9 @@ export function isValidModelName(value: string | undefined): value is AgentModel
  * @returns The full definition of the model.
  */
 export function getAgentModelDefinition(modelName: AgentModelName): AgentModelDefinition {
-	const definition = AGENT_MODEL_DEFINITIONS[modelName]
+	const definition =
+		(AGENT_MODEL_DEFINITIONS as Record<string, AgentModelDefinition | undefined>)[modelName] ??
+		liveModels.get(modelName)
 	if (!definition) {
 		throw new Error(`Model ${modelName} not found`)
 	}

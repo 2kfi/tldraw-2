@@ -15,8 +15,19 @@ export function getDb(): Database.Database {
       name TEXT NOT NULL,
       host_user_id TEXT,
       host_key_hash TEXT,
+      password_hash TEXT,
+      require_approval INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS join_requests (
+      room_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      user_color TEXT NOT NULL,
+      approved INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (room_id, user_id)
     );
     CREATE TABLE IF NOT EXISTS assets (
       id TEXT PRIMARY KEY,
@@ -37,5 +48,14 @@ export function getDb(): Database.Database {
       mtime REAL NOT NULL
     );
   `)
+  // Migration for DBs created before the access-control columns existed:
+  // CREATE TABLE IF NOT EXISTS never re-runs, so detect and ALTER instead.
+  const roomCols = db.prepare('PRAGMA table_info(rooms)').all() as { name: string }[]
+  if (!roomCols.some((c) => c.name === 'password_hash')) {
+    db.exec('ALTER TABLE rooms ADD COLUMN password_hash TEXT')
+  }
+  if (!roomCols.some((c) => c.name === 'require_approval')) {
+    db.exec('ALTER TABLE rooms ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0')
+  }
   return db
 }

@@ -8,10 +8,14 @@ export type AiModelInfo = {
   id: string
   name: string
   provider: string
+  /** False when the entry comes from a live provider fetch, not the static definitions. */
+  known?: boolean
 }
 
 export type AiModelsResponse = {
   models: AiModelInfo[]
+  /** True when a configured provider's live model fetch failed (static defs still returned). */
+  liveFailed?: boolean
 }
 
 export type MusicTrackInfo = {

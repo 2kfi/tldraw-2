@@ -4,6 +4,7 @@ import { TLSyncClient } from '@tldraw/sync-core'
 import type { TLPersistentClientSocket, TLSocketRoom, TLSocketStatusChangeEvent, WebSocketMinimal } from '@tldraw/sync-core'
 import { randomUUID } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
+import { log } from '../log'
 import {
 	Box,
 	Editor,
@@ -308,7 +309,7 @@ export class AiSession {
 			presence: atom('ai-presence', null),
 			presenceMode: atom('ai-presence-mode', 'full'),
 			onLoad: () => this.loadedResolve?.(),
-			onSyncError: (err) => console.error(`[ai] room ${this.roomId} sync error`, err),
+			onSyncError: (err) => log.error(`[ai] room ${this.roomId} sync error`, err),
 		})
 		this.client = client
 		this.syncStore = store
@@ -361,7 +362,7 @@ export class AiSession {
 				}
 			}
 		} catch (error) {
-			console.error(`[ai] room ${this.roomId} session loop error`, error)
+			log.error(`[ai] room ${this.roomId} session loop error`, error)
 		}
 	}
 
@@ -496,7 +497,7 @@ export class AiSession {
 					const sanitized = util.sanitizeAction(event, this.helpers!)
 					if (sanitized) await util.applyAction(sanitized, this.helpers!, this.runAbort.signal)
 				} catch (error) {
-					console.error(`[ai] room ${this.roomId} failed to apply ${event._type}`, error)
+					log.error(`[ai] room ${this.roomId} failed to apply ${event._type}`, error)
 				}
 			}
 			this.flushStreamingText()

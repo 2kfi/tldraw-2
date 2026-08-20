@@ -1,17 +1,74 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import type { Components } from 'react-markdown'
 import type { Editor } from 'tldraw'
 import { useValue } from 'tldraw'
 import { AI_STATE_ID, createDefaultAiState } from '../../shared/schema'
 import type { AiState } from '../../shared/schema'
-import type { AiModelsResponse } from '../../shared/types'
-import { getUser } from '../lib/user'
+import type { AiModelInfo, AiModelsResponse } from '../../shared/types'
+import { useUser } from '../lib/user'
 import { api } from '../lib/api'
 import { getAiContext } from './aiContext'
 import { usePanelSlide } from '../lib/usePanelSlide'
 
 const MODEL_KEY = 't2.aiModel'
 const DEFAULT_MODEL = 'claude-sonnet-4-6'
+
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: 'OpenAI',
+  google: 'Google',
+  anthropic: 'Anthropic',
+}
+
+// The agent can create/move/label/delete shapes, draw with the pen, align,
+// distribute, stack, recolor, and count shapes — pick suggestions that exercise
+// those verbs.
+const SUGGESTIONS = ['Draw a flowchart for login', 'Label my shapes', 'Group these by color']
+
+function groupModels(models: AiModelInfo[]): [string, AiModelInfo[]][] {
+  const groups = new Map<string, AiModelInfo[]>()
+  for (const m of models) {
+    const list = groups.get(m.provider)
+    if (list) list.push(m)
+    else groups.set(m.provider, [m])
+  }
+  return [...groups.entries()]
+}
+
+function BotGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="5" y="7" width="14" height="11" rx="3" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M12 7V4.2M12 4.2h1.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <circle cx="9.5" cy="12" r="1.2" fill="currentColor" />
+      <circle cx="14.5" cy="12" r="1.2" fill="currentColor" />
+      <path d="M9.5 15.4h5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function timeAgo(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (s < 10) return 'now'
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
+}
+
+// Action labels the agent emits look like "**Drew:**" / "**Labeled:**" — render
+// the leading bold "Label:" part as a small chip, leave prose emphasis alone.
+const markdownComponents: Components = {
+  strong({ children }) {
+    const first = Array.isArray(children) ? children[0] : children
+    if (typeof first === 'string' && first.endsWith(':')) {
+      return <span className="ai-chip">{children}</span>
+    }
+    return <strong>{children}</strong>
+  },
+}
 
 export function AIPanel({
   roomId,
@@ -25,7 +82,7 @@ export function AIPanel({
   onClose: () => void
 }) {
   const store = editor.store
-  const me = getUser()
+  const me = useUser()
   const panelRef = useRef<HTMLDivElement>(null)
   usePanelSlide(panelRef, 'left', open)
   // ponytail: aiState is validated by the schema at the sync boundary; the
@@ -33,22 +90,30 @@ export function AIPanel({
   const getAi = () => store.get(AI_STATE_ID as any) as AiState | undefined
   const putAi = (state: AiState) => store.put([state] as any)
   const aiState = useValue('aiState', getAi, [store])
-  const [models, setModels] = useState<string[]>([])
+  const [models, setModels] = useState<AiModelInfo[]>([])
   const [model, setModel] = useState(() => localStorage.getItem(MODEL_KEY) ?? '')
   const [input, setInput] = useState('')
   const chatRef = useRef<HTMLDivElement>(null)
+  const promptRef = useRef<HTMLTextAreaElement>(null)
+  // The conversation has no timestamps; stamp each message on first sight so
+  // relative times stay stable across re-renders and streaming.
+  const tsByIndex = useRef<number[]>([])
 
   useEffect(() => {
     let cancelled = false
-    api<AiModelsResponse>('/api/ai/models')
-      .then((res) => {
-        if (!cancelled) {
-          const ids = res.models.map((m) => m.id)
-          setModels(ids)
-          setModel((prev) => (ids.includes(prev) ? prev : ids[0] || DEFAULT_MODEL))
-        }
+    const apply = (list: AiModelInfo[]) => {
+      if (cancelled) return
+      setModels(list)
+      setModel((prev) => (list.some((m) => m.id === prev) ? prev : list[0]?.id || DEFAULT_MODEL))
+    }
+    api<AiModelsResponse>('/api/ai/models/live')
+      .then((res) => apply(res.models))
+      .catch(() => {
+        // Live list unavailable: fall back to the static endpoint behavior.
+        api<AiModelsResponse>('/api/ai/models')
+          .then((res) => apply(res.models))
+          .catch(() => { if (!cancelled) setModels([]) })
       })
-      .catch(() => { if (!cancelled) setModels([]) })
     return () => { cancelled = true }
   }, [])
 
@@ -60,6 +125,8 @@ export function AIPanel({
     if (!store.get(AI_STATE_ID as any)) putAi(createDefaultAiState())
   }, [store])
 
+  // Follow new content only when already near the bottom — don't yank the
+  // scroll position away from someone who scrolled up to read.
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
@@ -72,7 +139,20 @@ export function AIPanel({
   const lockedByMe = !!aiState?.lockedBy && aiState.lockedBy === me.id
   const lockedByOther = !!aiState?.lockedBy && aiState.lockedBy !== me.id
   const canSubmit = !running && !lockedByOther
-  const status = aiState?.status
+
+  const modelName = models.find((m) => m.id === model)?.name ?? (model || DEFAULT_MODEL)
+  const statusLine = aiState?.error
+    ? 'Error'
+    : running
+      ? 'thinking…'
+      : lockedByOther
+        ? 'busy'
+        : 'ready'
+
+  function tsFor(i: number): number {
+    if (tsByIndex.current[i] === undefined) tsByIndex.current[i] = Date.now()
+    return tsByIndex.current[i]!
+  }
 
   function submit() {
     const text = input.trim()
@@ -110,70 +190,124 @@ export function AIPanel({
     if (cur) putAi({ ...cur, conversation: [], streamingText: '' })
   }
 
-  const statusText = aiState?.error
+  function useSuggestion(text: string) {
+    setInput(text)
+    promptRef.current?.focus()
+  }
+
+  const footerStatus = aiState?.error
     ? 'Error: ' + aiState.error
-    : running
-      ? aiState?.status === 'pending'
-        ? 'Waiting for the AI…'
-        : 'AI is working…'
-      : lockedByOther
-        ? `${aiState?.lockedByName ?? 'Someone'} is using the AI…`
-        : ''
+    : lockedByOther
+      ? `${aiState?.lockedByName ?? 'Someone'} is using the AI…`
+      : ''
 
   return (
     <aside className="ai-panel" ref={panelRef}>
       <div className="ai-panel-header">
         <div className="ai-panel-title">
-          <span>AI assistant</span>
-          <span className="ai-title-actions">
+          <span className="ai-panel-name">AI assistant</span>
+          <div className="ai-title-actions">
             <button className="ai-clear" onClick={clearConversation} disabled={running || conversation.length === 0}>
               Clear
             </button>
-            <button className="ai-clear" onClick={onClose} title="Close">
-              ✕
+            <button className="ai-close" onClick={onClose} title="Close" aria-label="Close">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
             </button>
-          </span>
+          </div>
         </div>
-        <div className="ai-panel-sub">
+        <div className="ai-model-row">
           <select
             className="ai-input ai-model"
             value={model}
             onChange={(e) => setModel(e.target.value)}
+            aria-label="Model"
           >
-            {models.map((id) => (
-              <option key={id} value={id}>{id}</option>
+            {groupModels(models).map(([provider, list]) => (
+              <optgroup key={provider} label={PROVIDER_LABELS[provider] ?? provider}>
+                {list.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.known ? m.name : `${m.id} (live)`}
+                  </option>
+                ))}
+              </optgroup>
             ))}
           </select>
+          <span
+            className={`ai-statusline${aiState?.error ? ' ai-statusline-error' : running ? ' ai-statusline-thinking' : ''}`}
+          >
+            {modelName} · {statusLine}
+          </span>
         </div>
       </div>
 
       <div className="ai-chat" ref={chatRef}>
-        {conversation.map((m, i) => (
-          <div key={i} className={`ai-msg ai-${m.role}`}>
-            <div className="ai-msg-name">{m.role === 'user' ? me.name : 'AI'}</div>
-            <div className="ai-msg-body">
-              <ReactMarkdown>{m.content}</ReactMarkdown>
+        {conversation.map((m, i) => {
+          const isUser = m.role === 'user'
+          return (
+            <div key={i} className={`ai-msg ai-${m.role}`}>
+              {isUser ? (
+                <span className="ai-avatar" style={{ background: me.color }} aria-hidden="true">
+                  {me.name[0] ?? '?'}
+                </span>
+              ) : (
+                <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
+                  <BotGlyph />
+                </span>
+              )}
+              <div className="ai-msg-main">
+                <div className="ai-msg-meta">
+                  <span className="ai-msg-name">{isUser ? me.name : 'AI'}</span>
+                  <span className="ai-msg-time">{timeAgo(tsFor(i))}</span>
+                </div>
+                <div className="ai-msg-body">
+                  <ReactMarkdown components={markdownComponents}>{m.content}</ReactMarkdown>
+                </div>
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
         {running && (
           <div className="ai-msg ai-assistant ai-streaming">
-            <div className="ai-msg-name">AI</div>
-            <div className="ai-msg-body">
-              <ReactMarkdown>{aiState?.streamingText || '…'}</ReactMarkdown>
+            <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
+              <BotGlyph />
+            </span>
+            <div className="ai-msg-main">
+              <div className="ai-msg-meta">
+                <span className="ai-msg-name">AI</span>
+                <span className="ai-msg-time">typing…</span>
+              </div>
+              <div className="ai-msg-body">
+                <ReactMarkdown components={markdownComponents}>{aiState?.streamingText || '…'}</ReactMarkdown>
+              </div>
             </div>
           </div>
         )}
         {!running && conversation.length === 0 && (
-          <div className="ai-empty">Ask the AI to draw, label, organize, or explain the board.</div>
+          <div className="ai-empty">
+            <span className="ai-empty-glyph" aria-hidden="true">
+              <BotGlyph />
+            </span>
+            <div className="ai-empty-title">What should we make?</div>
+            <p className="ai-empty-sub">Ask me to draw, label, arrange, or explain anything on the board.</p>
+            <div className="ai-suggest">
+              {SUGGESTIONS.map((s) => (
+                <button key={s} className="ai-suggest-chip" onClick={() => useSuggestion(s)}>
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
         )}
       </div>
 
-      {statusText && <div className={`ai-status${aiState?.error ? ' ai-status-error' : ''}`}>{statusText}</div>}
+      {footerStatus && <div className={`ai-status${aiState?.error ? ' ai-status-error' : ''}`}>{footerStatus}</div>}
 
       <div className="ai-footer">
         <div className="ai-row">
           <textarea
+            ref={promptRef}
             className="ai-input ai-prompt"
             rows={2}
             value={input}

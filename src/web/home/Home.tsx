@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getUser, setUser } from '../lib/user'
+import { setUser, useUser } from '../lib/user'
 import { allHostKeys, getHostToken, setHostKey, setHostToken } from '../lib/host'
 import { api } from '../lib/api'
 
@@ -12,6 +12,8 @@ function boardLink(roomId: string) {
 export function Home() {
   const [joinId, setJoinId] = useState('')
   const [boards, setBoards] = useState<MyBoard[] | null>(null)
+  const [createPassword, setCreatePassword] = useState('')
+  const [requireApproval, setRequireApproval] = useState(false)
 
   async function refreshBoards() {
     const keys = Object.values(allHostKeys())
@@ -35,7 +37,14 @@ export function Home() {
   }, [])
 
   async function createRoom() {
-    const res = await api<{ roomId: string; hostKey: string }>('/api/rooms', { method: 'POST' })
+    const res = await api<{ roomId: string; hostKey: string }>('/api/rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(createPassword ? { password: createPassword } : {}),
+        requireApproval,
+      }),
+    })
     setHostKey(res.roomId, res.hostKey)
     try {
       const claim = await api<{ hostToken: string }>(`/api/rooms/${res.roomId}/claim`, {
@@ -76,16 +85,29 @@ export function Home() {
     await navigator.clipboard.writeText(boardLink(board.roomId))
   }
 
-  const user = getUser()
+  const user = useUser()
 
   return (
     <div className="home">
       <h1 className="home-title">tldraw-2</h1>
       <p className="home-subtitle">A shared, self-hosted whiteboard.</p>
       <div className="home-actions">
-        <button className="home-link" onClick={createRoom}>
-          Create a room
-        </button>
+        <form className="home-create" onSubmit={(e) => { e.preventDefault(); createRoom() }}>
+          <input
+            className="home-input"
+            type="password"
+            value={createPassword}
+            onChange={(e) => setCreatePassword(e.target.value)}
+            placeholder="Optional password"
+          />
+          <label className="home-check">
+            <input type="checkbox" checked={requireApproval} onChange={(e) => setRequireApproval(e.target.checked)} />
+            Require host approval
+          </label>
+          <button className="home-link" type="submit">
+            Create a room
+          </button>
+        </form>
         <form className="home-join" onSubmit={joinRoom}>
           <input
             className="home-input"

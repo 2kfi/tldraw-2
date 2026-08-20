@@ -7,7 +7,7 @@ import type { MusicState } from '../../shared/schema'
 import type { MusicTrackInfo, MusicTracksResponse } from '../../shared/types'
 import { api } from '../lib/api'
 import { getHostKey, getHostToken } from '../lib/host'
-import { getUser } from '../lib/user'
+import { useUser } from '../lib/user'
 import { usePanelSlide } from '../lib/usePanelSlide'
 
 function fmt(s: number): string {
@@ -29,7 +29,7 @@ export function MusicPanel({
   onClose: () => void
 }) {
   const store = editor.store
-  const me = getUser()
+  const me = useUser()
   const isHost = getHostKey(roomId) !== null
   const panelRef = useRef<HTMLDivElement>(null)
   usePanelSlide(panelRef, 'right', open)
@@ -49,10 +49,42 @@ export function MusicPanel({
   const [drag, setDrag] = useState<number | null>(null)
   const [playbackError, setPlaybackError] = useState<string | null>(null)
 
+  // per-browser volume (local only — never synced to the room)
+  const [volume, setVolume] = useState(() => {
+    const v = Number(localStorage.getItem('t2.volume'))
+    return Number.isFinite(v) && v >= 0 && v <= 100 ? v : 80
+  })
+  const [muted, setMuted] = useState(() => localStorage.getItem('t2.volumeMuted') === '1')
+
   const audioRef = useRef<HTMLAudioElement>(null)
   const discRef = useRef<HTMLDivElement>(null)
   const tweenRef = useRef<gsap.core.Tween | null>(null)
   const seekingRef = useRef(false)
+
+  // apply the local volume to the shared <audio> element; purely per-browser
+  useEffect(() => {
+    const audio = audioRef.current
+    if (audio) audio.volume = muted ? 0 : volume / 100
+  }, [volume, muted])
+
+  function setVolumeAndPersist(v: number) {
+    setVolume(v)
+    localStorage.setItem('t2.volume', String(v))
+    if (v === 0) {
+      setMuted(true)
+      localStorage.setItem('t2.volumeMuted', '1')
+    } else if (muted) {
+      setMuted(false)
+      localStorage.removeItem('t2.volumeMuted')
+    }
+  }
+
+  function toggleMute() {
+    setMuted((m) => {
+      localStorage.setItem('t2.volumeMuted', m ? '0' : '1')
+      return !m
+    })
+  }
 
   const canControl = isHost || (music?.allowedMemberIds ?? []).includes(me.id)
 
@@ -253,6 +285,28 @@ export function MusicPanel({
               Join playback
             </button>
           )}
+        </div>
+
+        <div className="music-volume">
+          <button
+            className="music-btn music-vol-toggle"
+            onClick={toggleMute}
+            title={muted ? 'Unmute' : 'Mute'}
+            aria-pressed={muted}
+          >
+            {muted || volume === 0 ? '🔇' : volume < 50 ? '🔉' : '🔊'}
+          </button>
+          <input
+            className="music-range music-vol-slider"
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={volume}
+            aria-label="Volume"
+            onChange={(e) => setVolumeAndPersist(Number(e.target.value))}
+          />
+          <span className="music-vol-pct">{muted || volume === 0 ? '0' : volume}%</span>
         </div>
 
         {current && (

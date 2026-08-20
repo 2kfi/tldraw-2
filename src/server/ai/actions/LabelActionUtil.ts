@@ -3,6 +3,7 @@ import { LabelAction } from '../../../shared/agent/schema/AgentActionSchemas'
 import { Streaming } from '../../../shared/agent/types/Streaming'
 import { AgentHelpers } from '../helpers'
 import { AgentActionUtil, registerActionUtil } from './AgentActionUtil'
+import { log } from '../../log'
 
 type ShapeWithRichText = Extract<TLShape, { props: { richText: TLRichText } }>
 
@@ -41,7 +42,7 @@ export const LabelActionUtil = registerActionUtil(
 				return null
 			}
 			if (!isShapeWithRichText(shape)) {
-				console.warn(`Shape type "${shape.type}" does not support richText labels`)
+				log.warn(`Shape type "${shape.type}" does not support richText labels`)
 				return null
 			}
 			action.shapeId = shapeId

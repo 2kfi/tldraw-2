@@ -12,7 +12,9 @@ import {
 	AgentModelProvider,
 	getAgentModelDefinition,
 	isValidModelName,
+	registerLiveModel,
 } from '../../shared/agent/models'
+import { log } from '../log'
 import { DebugPart } from '../../shared/agent/schema/PromptPartDefinitions'
 import { AgentAction } from '../../shared/agent/types/AgentAction'
 import { AgentPrompt } from '../../shared/agent/types/AgentPrompt'
@@ -34,6 +36,9 @@ export class AgentService {
 	anthropic: AnthropicProvider
 	google: GoogleGenerativeAIProvider
 	private readonly configured: Record<AgentModelProvider, boolean>
+	private readonly openaiApiKey: string | undefined
+	private readonly openaiBaseUrl: string | undefined
+	private readonly googleApiKey: string | undefined
 
 	constructor(config: AgentServiceConfig) {
 		this.configured = {
@@ -41,6 +46,9 @@ export class AgentService {
 			anthropic: !!config.anthropicApiKey,
 			google: !!config.googleApiKey,
 		}
+		this.openaiApiKey = config.openaiApiKey
+		this.openaiBaseUrl = config.openaiBaseUrl
+		this.googleApiKey = config.googleApiKey
 		// ponytail: createOpenAI's baseURL accepts any OpenAI-compatible endpoint
 		// (OPENAI_BASE_URL); the plan relies on this to work against proxies.
 		this.openai = createOpenAI({
@@ -70,13 +78,72 @@ export class AgentService {
 		return this[provider](modelDefinition.id)
 	}
 
+	/**
+	 * Models each configured provider actually serves, fetched at request time
+	 * and registered so they're runnable. Best-effort: a failing provider is
+	 * skipped (3s timeout); never throws — callers merge with the static
+	 * definitions and surface liveFailed.
+	 */
+	async listLiveModels(): Promise<{
+		models: { provider: AgentModelProvider; id: string }[]
+		liveFailed: boolean
+	}> {
+		const models: { provider: AgentModelProvider; id: string }[] = []
+		let liveFailed = false
+		if (this.configured.openai) {
+			try {
+				const base = (this.openaiBaseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
+				const res = await fetch(`${base}/models`, {
+					headers: { Authorization: `Bearer ${this.openaiApiKey}` },
+					signal: AbortSignal.timeout(3000),
+				})
+				if (res.ok) {
+					const body = (await res.json()) as { data?: { id?: string }[] }
+					for (const m of body.data ?? []) {
+						if (m.id && isChatModel('openai', m.id)) {
+							registerLiveModel(m.id, 'openai')
+							models.push({ provider: 'openai', id: m.id })
+						}
+					}
+				} else {
+					liveFailed = true
+				}
+			} catch {
+				liveFailed = true
+			}
+		}
+		if (this.configured.google) {
+			try {
+				const res = await fetch(
+					`https://generativelanguage.googleapis.com/v1beta/models?key=${this.googleApiKey}`,
+					{ signal: AbortSignal.timeout(3000) }
+				)
+				if (res.ok) {
+					const body = (await res.json()) as { models?: { name?: string }[] }
+					for (const m of body.models ?? []) {
+						const id = m.name?.replace(/^models\//, '')
+						if (id && isChatModel('google', id)) {
+							registerLiveModel(id, 'google')
+							models.push({ provider: 'google', id })
+						}
+					}
+				} else {
+					liveFailed = true
+				}
+			} catch {
+				liveFailed = true
+			}
+		}
+		return { models, liveFailed }
+	}
+
 	async *stream(prompt: AgentPrompt): AsyncGenerator<Streaming<AgentAction>> {
 		try {
 			for await (const event of this.streamActions(prompt)) {
 				yield event
 			}
 		} catch (error: any) {
-			console.error('Stream error:', error)
+			log.error('Stream error:', error)
 			throw error
 		}
 	}
@@ -127,10 +194,10 @@ export class AgentService {
 		if (debugPart) {
 			if (debugPart.logSystemPrompt) {
 				const promptWithoutSchema = buildSystemPrompt(prompt, { withSchema: false })
-				console.log('[DEBUG] System Prompt (without schema):\n', promptWithoutSchema)
+				log.debug('[DEBUG] System Prompt (without schema):\n', promptWithoutSchema)
 			}
 			if (debugPart.logMessages) {
-				console.log('[DEBUG] Messages:\n', JSON.stringify(promptMessages, null, 2))
+				log.debug('[DEBUG] Messages:\n', JSON.stringify(promptMessages, null, 2))
 			}
 		}
 
@@ -157,10 +224,10 @@ export class AgentService {
 				...(modelDefinition.supportsTemperature ? { temperature: 0 } : {}),
 				providerOptions: getProviderOptions(modelDefinition),
 				onAbort() {
-					console.warn('Stream actions aborted')
+					log.warn('Stream actions aborted')
 				},
 				onError: (e) => {
-					console.error('Stream text error:', e)
+					log.error('Stream text error:', e)
 					throw e
 				},
 			})
@@ -223,13 +290,23 @@ while (actions.length > cursor) {
 				}
 			}
 		} catch (error: any) {
-			console.error('streamActions error:', error)
+			log.error('streamActions error:', error)
 			throw error
 		}
 	}
 }
 
 type StreamTextProviderOptions = NonNullable<Parameters<typeof streamText>[0]['providerOptions']>
+
+// ponytail: keep clearly non-text-generation ids out of the chat picker
+// (embeddings, speech, image, moderation, codex, ...). A visible run error
+// beats a picker full of models that can't talk; the filter is cheap.
+function isChatModel(provider: AgentModelProvider, id: string): boolean {
+	if (provider === 'google') {
+		return id.startsWith('gemini') && !/image|audio|tts|customtools|computer-use|live/i.test(id)
+	}
+	return !/embedding|whisper|tts|dall.?e|audio|realtime|moderation|transcrib|translat|speech|image|codex/i.test(id)
+}
 
 /**
  * Map a model definition's reasoning preferences to AI SDK provider options.
