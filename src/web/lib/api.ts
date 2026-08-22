@@ -8,7 +8,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // keep the default message
     }
-    throw new Error(message)
+    // attach the HTTP status so callers can branch (e.g. 404 vs other failures)
+    const err = new Error(message) as Error & { status?: number }
+    err.status = res.status
+    throw err
   }
   return (await res.json()) as T
 }

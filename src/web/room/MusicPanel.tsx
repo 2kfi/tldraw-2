@@ -17,6 +17,67 @@ function fmt(s: number): string {
   return `${m}:${String(sec).padStart(2, '0')}`
 }
 
+/* Line icons matching the 1.6-stroke style used in RoomChrome/AIPanel. */
+function IconX() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function IconVolume({ level }: { level: 0 | 1 | 2 }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 9.5v5h3l4 3.5v-12L7 9.5H4Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      {level === 0 ? (
+        <path d="M15 9.5l5 5M20 9.5l-5 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      ) : (
+        <>
+          <path d="M14.5 9.8a3.4 3.4 0 0 1 0 4.4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          {level === 2 && (
+            <path d="M17 7.2a7 7 0 0 1 0 9.6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          )}
+        </>
+      )}
+    </svg>
+  )
+}
+
+function IconPrev() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M6.5 5.5v13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M17.5 6v12L9 12l8.5-6Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function IconNext() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M17.5 5.5v13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M6.5 6v12L15 12 6.5 6Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function IconPlay() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M8.5 5.5v13L18 12 8.5 5.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function IconPause() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M9 5.5v13M15 5.5v13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 export function MusicPanel({
   roomId,
   editor,
@@ -30,7 +91,9 @@ export function MusicPanel({
 }) {
   const store = editor.store
   const me = useUser()
-  const isHost = getHostKey(roomId) !== null
+  // localStorage + JSON.parse per render adds up; the host key only changes on
+  // claim (which reloads state), so memoize per roomId.
+  const isHost = useMemo(() => getHostKey(roomId) !== null, [roomId])
   const panelRef = useRef<HTMLDivElement>(null)
   usePanelSlide(panelRef, 'right', open)
 
@@ -88,10 +151,20 @@ export function MusicPanel({
 
   const canControl = isHost || (music?.allowedMemberIds ?? []).includes(me.id)
 
+  // Only subscribe while the panel is open: the compute touches the store
+  // conditionally, so closed panels track no signals and never re-render on
+  // collaborator cursor moves.
   const presences = useValue(
     'presences',
-    () => store.query.records('instance_presence').get() as unknown as { userId: string; userName: string; color: string }[],
-    [store]
+    () =>
+      open
+        ? (store.query.records('instance_presence').get() as unknown as {
+            userId: string
+            userName: string
+            color: string
+          }[])
+        : [],
+    [store, open]
   )
 
   const trackById = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks])
@@ -118,10 +191,14 @@ export function MusicPanel({
   useEffect(() => {
     if (!music) return
     const id = window.setInterval(() => {
-      if (!seekingRef.current) setProgress(currentPos(music) / 1000)
+      // closed panel → nobody sees the number; paused → position is constant
+      // (React bails on the identical setState), so only playing ticks render.
+      if (!open || seekingRef.current) return
+      const pos = currentPos(music) / 1000
+      setProgress((prev) => (prev === pos ? prev : pos))
     }, 250)
     return () => window.clearInterval(id)
-  }, [music])
+  }, [music, open])
 
   // GSAP disc: continuous rotation while playing, paused otherwise. CSS can't
   // do a per-state tween we can resume, and @gsap/react isn't installed.
@@ -138,11 +215,14 @@ export function MusicPanel({
   useEffect(() => {
     const tween = tweenRef.current
     if (!tween) return
-    if (music?.playing && joined) {
-      tween.restart()
-      tween.play()
-    } else tween.pause()
-  }, [music?.playing, joined])
+    // hidden panel → don't spin the disc off-screen
+    if (!open || !music?.playing || !joined) {
+      tween.pause()
+      return
+    }
+    tween.restart()
+    tween.play()
+  }, [music?.playing, joined, open])
 
   // keep the <audio> engine matching the synced record
   useEffect(() => {
@@ -211,6 +291,7 @@ export function MusicPanel({
   }
 
   function commitSeek(value: string) {
+    if (!seekingRef.current) return
     const t = Number(value)
     setDrag(null)
     seekingRef.current = false
@@ -219,6 +300,16 @@ export function MusicPanel({
       setProgress(t)
     }
   }
+
+  // A pointerup can land outside the input (fast finger off-slider); commit
+  // from a window-level listener too. The input's own onPointerUp/onKeyUp stay
+  // as fast paths — commitSeek is guarded so it only runs once.
+  useEffect(() => {
+    if (drag === null) return
+    const onUp = () => commitSeek(String(drag))
+    window.addEventListener('pointerup', onUp)
+    return () => window.removeEventListener('pointerup', onUp)
+  }, [drag])
 
   function refresh() {
     const token = getHostToken(roomId)
@@ -260,8 +351,8 @@ export function MusicPanel({
                 Refresh
               </button>
             )}
-            <button className="music-btn" onClick={onClose} title="Collapse">
-              ✕
+            <button className="music-btn" onClick={onClose} title="Collapse" aria-label="Collapse">
+              <IconX />
             </button>
           </span>
         </div>
@@ -292,9 +383,10 @@ export function MusicPanel({
             className="music-btn music-vol-toggle"
             onClick={toggleMute}
             title={muted ? 'Unmute' : 'Mute'}
+            aria-label={muted ? 'Unmute' : 'Mute'}
             aria-pressed={muted}
           >
-            {muted || volume === 0 ? '🔇' : volume < 50 ? '🔉' : '🔊'}
+            <IconVolume level={muted || volume === 0 ? 0 : volume < 50 ? 1 : 2} />
           </button>
           <input
             className="music-range music-vol-slider"
@@ -333,14 +425,19 @@ export function MusicPanel({
               <span>{fmt(current.duration)}</span>
             </div>
             <div className="music-buttons">
-              <button className="music-btn" onClick={() => step(-1)} disabled={!canControl}>
-                ⏮
+              <button className="music-btn" onClick={() => step(-1)} disabled={!canControl} aria-label="Previous track">
+                <IconPrev />
               </button>
-              <button className="music-btn music-play" onClick={togglePlay} disabled={!canControl}>
-                {music?.playing ? '❚❚' : '▶'}
+              <button
+                className="music-btn music-play"
+                onClick={togglePlay}
+                disabled={!canControl}
+                aria-label={music?.playing ? 'Pause' : 'Play'}
+              >
+                {music?.playing ? <IconPause /> : <IconPlay />}
               </button>
-              <button className="music-btn" onClick={() => step(1)} disabled={!canControl}>
-                ⏭
+              <button className="music-btn" onClick={() => step(1)} disabled={!canControl} aria-label="Next track">
+                <IconNext />
               </button>
             </div>
             {!canControl && <div className="music-hint">Only the host or a promoted DJ can control playback.</div>}
@@ -377,8 +474,8 @@ export function MusicPanel({
                 {music?.allowedMemberIds.map((uid) => (
                   <span key={uid} className="music-dj">
                     {nameFor(uid)}
-                    <button className="music-dj-x" onClick={() => toggleDJ(uid)} title="Revoke DJ">
-                      ✕
+                    <button className="music-dj-x" onClick={() => toggleDJ(uid)} title="Revoke DJ" aria-label={`Revoke DJ for ${nameFor(uid)}`}>
+                      <IconX />
                     </button>
                   </span>
                 ))}

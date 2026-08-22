@@ -14,6 +14,7 @@ export function Home() {
   const [boards, setBoards] = useState<MyBoard[] | null>(null)
   const [createPassword, setCreatePassword] = useState('')
   const [requireApproval, setRequireApproval] = useState(false)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
 
   async function refreshBoards() {
     const keys = Object.values(allHostKeys())
@@ -81,8 +82,23 @@ export function Home() {
     refreshBoards()
   }
 
+  // Clipboard API needs a secure context; fall back to execCommand on HTTP.
   async function copyLink(board: MyBoard) {
-    await navigator.clipboard.writeText(boardLink(board.roomId))
+    const url = boardLink(board.roomId)
+    let ok = false
+    try {
+      await navigator.clipboard.writeText(url)
+      ok = true
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = url
+      document.body.appendChild(ta)
+      ta.select()
+      ok = document.execCommand('copy')
+      ta.remove()
+    }
+    setCopiedId(ok ? board.roomId : 'error')
+    window.setTimeout(() => setCopiedId(null), 1500)
   }
 
   const user = useUser()
@@ -143,7 +159,7 @@ export function Home() {
                     </button>
                   )}
                   <button className="board-btn" onClick={() => copyLink(b)}>
-                    Copy link
+                    {copiedId === b.roomId ? 'Copied!' : copiedId === 'error' ? 'Copy failed' : 'Copy link'}
                   </button>
                   <a className="board-link" href={boardLink(b.roomId)}>
                     Open

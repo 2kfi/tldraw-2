@@ -128,6 +128,36 @@ function parse<T>(schema: z.ZodType<T>, body: unknown, res: { status: (n: number
 export function createRoomsRouter(db: Database, userFromReq: UserParser) {
   const router = Router()
 
+  // Prepared once at setup instead of per request. (PUT /api/rooms/:id keeps an
+  // inline prepare — its SET clause is composed from the request body.)
+  const insertRoomStmt = db.prepare(
+    'INSERT INTO rooms (id, name, host_user_id, host_key_hash, password_hash, require_approval, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)'
+  )
+  const selectRoomByIdStmt = db.prepare(
+    'SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms WHERE id = ?'
+  )
+  const updateRoomHostStmt = db.prepare('UPDATE rooms SET host_user_id = ?, updated_at = ? WHERE id = ?')
+  const selectAllRoomsStmt = db.prepare(
+    'SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms'
+  )
+  const selectJoinRequestStmt = db.prepare('SELECT approved FROM join_requests WHERE room_id = ? AND user_id = ?')
+  const insertJoinRequestStmt = db.prepare(
+    `INSERT INTO join_requests (room_id, user_id, user_name, user_color, approved, created_at)
+     VALUES (?, ?, ?, ?, 0, ?)
+     ON CONFLICT(room_id, user_id) DO UPDATE SET
+       user_name = excluded.user_name, user_color = excluded.user_color,
+       approved = 0, created_at = excluded.created_at`
+  )
+  // ponytail: join_requests grows forever otherwise; approved rows older than a
+  // week are pruned lazily on pending reads. Pending rows stay (they're the queue).
+  const pruneApprovedJoinsStmt = db.prepare(
+    `DELETE FROM join_requests WHERE approved = 1 AND created_at < ?`
+  )
+  const selectPendingJoinsStmt = db.prepare(
+    'SELECT user_id, user_name, user_color, created_at FROM join_requests WHERE room_id = ? AND approved = 0 ORDER BY created_at ASC'
+  )
+  const approveJoinStmt = db.prepare('UPDATE join_requests SET approved = 1 WHERE room_id = ? AND user_id = ?')
+
   router.post('/api/rooms', (req, res) => {
     const body = parse(createBody, req.body, res)
     if (!body) return
@@ -135,9 +165,7 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
     const hostKey = randomHostKey()
     const name = body.name ?? DEFAULT_NAME
     const now = Date.now()
-    db.prepare(
-      'INSERT INTO rooms (id, name, host_user_id, host_key_hash, password_hash, require_approval, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)'
-    ).run(
+    insertRoomStmt.run(
       roomId,
       name,
       hostKeyHash(hostKey, roomId),
@@ -150,9 +178,7 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
   })
 
   router.get('/api/rooms/:id', (req, res) => {
-    const row = db
-      .prepare('SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms WHERE id = ?')
-      .get(req.params.id) as RoomRow | undefined
+    const row = selectRoomByIdStmt.get(req.params.id) as RoomRow | undefined
     if (!row) {
       res.status(404).json({ error: 'room not found' })
       return
@@ -199,11 +225,15 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
   router.post('/api/rooms/:id/join', (req, res) => {
     const body = parse(joinBody, req.body, res)
     if (!body) return
-    const row = db
-      .prepare('SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms WHERE id = ?')
-      .get(req.params.id) as RoomRow | undefined
+    const row = selectRoomByIdStmt.get(req.params.id) as RoomRow | undefined
     if (!row) {
       res.status(404).json({ error: 'room not found' })
+      return
+    }
+    // The host never enters their own password or waits for approval.
+    const hostUserId = requireHostToken(req.params.id, req.headers['x-host-token'] as string | undefined)
+    if (hostUserId) {
+      res.json({ status: 'ok', token: issueJoinToken(row.id, hostUserId) })
       return
     }
     const user = userFromReq(req)
@@ -213,20 +243,12 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
         return
       }
       if (row.require_approval) {
-        const existing = db
-          .prepare('SELECT approved FROM join_requests WHERE room_id = ? AND user_id = ?')
-          .get(row.id, user.id) as { approved: number } | undefined
+        const existing = selectJoinRequestStmt.get(row.id, user.id) as { approved: number } | undefined
         if (existing?.approved) {
           res.json({ status: 'ok', token: issueJoinToken(row.id, user.id) })
           return
         }
-        db.prepare(
-          `INSERT INTO join_requests (room_id, user_id, user_name, user_color, approved, created_at)
-           VALUES (?, ?, ?, ?, 0, ?)
-           ON CONFLICT(room_id, user_id) DO UPDATE SET
-             user_name = excluded.user_name, user_color = excluded.user_color,
-             approved = 0, created_at = excluded.created_at`
-        ).run(row.id, user.id, user.name, user.color, Date.now())
+        insertJoinRequestStmt.run(row.id, user.id, user.name, user.color, Date.now())
         res.json({ status: 'pending' })
         return
       }
@@ -235,9 +257,7 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
   })
 
   router.get('/api/rooms/:id/join/status', (req, res) => {
-    const row = db
-      .prepare('SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms WHERE id = ?')
-      .get(req.params.id) as RoomRow | undefined
+    const row = selectRoomByIdStmt.get(req.params.id) as RoomRow | undefined
     if (!row) {
       res.status(404).json({ error: 'room not found' })
       return
@@ -247,9 +267,7 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
       res.json({ status: 'ok', token: issueJoinToken(row.id, user.id) })
       return
     }
-    const reqRow = db
-      .prepare('SELECT approved FROM join_requests WHERE room_id = ? AND user_id = ?')
-      .get(row.id, user.id) as { approved: number } | undefined
+    const reqRow = selectJoinRequestStmt.get(row.id, user.id) as { approved: number } | undefined
     if (reqRow?.approved) {
       res.json({ status: 'approved', token: issueJoinToken(row.id, user.id) })
       return
@@ -262,11 +280,14 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
       res.status(401).json({ error: 'host token required' })
       return
     }
-    const rows = db
-      .prepare(
-        'SELECT user_id, user_name, user_color, created_at FROM join_requests WHERE room_id = ? AND approved = 0 ORDER BY created_at ASC'
-      )
-      .all(req.params.id) as { user_id: string; user_name: string; user_color: string; created_at: number }[]
+    // lazy prune of week-old approved rows (see pruneApprovedJoinsStmt)
+    pruneApprovedJoinsStmt.run(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    const rows = selectPendingJoinsStmt.all(req.params.id) as {
+      user_id: string
+      user_name: string
+      user_color: string
+      created_at: number
+    }[]
     res.json(rows.map((r) => ({ userId: r.user_id, userName: r.user_name, userColor: r.user_color, createdAt: r.created_at })))
   })
 
@@ -277,14 +298,14 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
     }
     const body = parse(approveBody, req.body, res)
     if (!body) return
-    db.prepare('UPDATE join_requests SET approved = 1 WHERE room_id = ? AND user_id = ?').run(req.params.id, body.userId)
+    approveJoinStmt.run(req.params.id, body.userId)
     res.json({ ok: true })
   })
 
   router.post('/api/rooms/:id/claim', (req, res) => {
     const body = parse(claimBody, req.body, res)
     if (!body) return
-    const row = db.prepare('SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms WHERE id = ?').get(req.params.id) as RoomRow | undefined
+    const row = selectRoomByIdStmt.get(req.params.id) as RoomRow | undefined
     if (!row) {
       res.status(404).json({ error: 'room not found' })
       return
@@ -294,23 +315,25 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
       return
     }
     const user = userFromReq(req)
-    db.prepare('UPDATE rooms SET host_user_id = ?, updated_at = ? WHERE id = ?').run(user.id, Date.now(), row.id)
+    updateRoomHostStmt.run(user.id, Date.now(), row.id)
     res.json({ hostToken: issueHostToken(row.id, user.id), room: toPublicInfo(row) })
   })
 
   router.post('/api/rooms/mine', (req, res) => {
     const body = parse(mineBody, req.body, res)
     if (!body) return
-    const rows = db.prepare('SELECT id, name, host_key_hash, host_user_id, password_hash, require_approval, updated_at FROM rooms').all() as RoomRow[]
+    const rows = selectAllRoomsStmt.all() as RoomRow[]
     const found: { roomId: string; name: string; updatedAt: number }[] = []
+    // ponytail: worst case (no key matches) is still keys × rows sha256s; fine
+    // at this scale. Each room can match at most one key, so matched rooms drop
+    // out of the pool and findIndex early-exits on first hit.
+    let pool = rows.filter((r) => !!r.host_key_hash)
     for (const key of body.keys) {
-      for (const row of rows) {
-        if (row.host_key_hash && hashMatches(key, row.id, row.host_key_hash)) {
-          const { id: roomId, ...rest } = toInfo(row)
-          found.push({ roomId, ...rest })
-          break
-        }
-      }
+      const idx = pool.findIndex((row) => hashMatches(key, row.id, row.host_key_hash!))
+      if (idx < 0) continue
+      const { id: roomId, ...rest } = toInfo(pool[idx]!)
+      found.push({ roomId, ...rest })
+      pool = pool.filter((_, i) => i !== idx)
     }
     res.json(found)
   })

@@ -83,10 +83,14 @@ export function createMusicRouter(db: Database) {
       return
     }
     const ext = path.extname(abs).slice(1).toLowerCase()
-    // same sendFile Range pattern as /media/asset, but tracks change on rescan
+    // ponytail: scanner.ts keeps the same track id when a file changes on disk
+    // (mtime differs → re-parse, old id reused), so bytes can mutate under one
+    // id — immutable long-cache would serve stale audio. sendFile's defaults
+    // give ETag + Last-Modified + public,max-age=0: browsers keep the copy and
+    // revalidate with cheap 304s instead of re-downloading.
     res.sendFile(abs, {
       acceptRanges: true,
-      headers: { 'Cache-Control': 'no-cache', 'Content-Type': MIME[ext] ?? 'application/octet-stream' },
+      headers: { 'Content-Type': MIME[ext] ?? 'application/octet-stream' },
     })
   })
 

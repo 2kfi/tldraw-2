@@ -33,12 +33,28 @@ const CANVAS_BG_KEY = 't2.canvasBg'
 
 function getStoredTheme(): Theme {
   const v = localStorage.getItem(THEME_KEY)
-  return v === 'light' || v === 'dark' ? v : 'dark'
+  return v === 'light' || v === 'dark' ? v : 'light'
 }
 
 function getStoredBg(): CanvasBg {
   const v = localStorage.getItem(CANVAS_BG_KEY)
-  return v === 'graph' || v === 'dots' || v === 'none' ? v : 'none'
+  return v === 'graph' || v === 'dots' || v === 'none' ? v : 'dots'
+}
+
+// Hosts skip the password/approval gate entirely (server-side bypass via
+// X-Host-Token); returns a join token or null.
+async function hostAutoJoin(roomId: string): Promise<string | null> {
+  const token = getHostToken(roomId)
+  if (!token) return null
+  try {
+    const res = await api<{ status: 'ok' | 'pending'; token?: string }>(`/api/rooms/${roomId}/join`, {
+      method: 'POST',
+      headers: { 'X-Host-Token': token },
+    })
+    return res.token ?? null
+  } catch {
+    return null
+  }
 }
 
 function DiscIcon() {
@@ -118,7 +134,8 @@ function RoomChrome({
   const [claimOpen, setClaimOpen] = useState(false)
   const [claimKey, setClaimKey] = useState('')
   const [claimError, setClaimError] = useState<string | null>(null)
-  const isHost = getHostKey(roomId) !== null
+  // localStorage + JSON.parse per render; host key only changes on claim.
+  const isHost = useMemo(() => getHostKey(roomId) !== null, [roomId])
 
   // Profile popover state: draft name is local, committed on blur/Enter.
   const [profileOpen, setProfileOpen] = useState(false)
@@ -144,7 +161,11 @@ function RoomChrome({
   const [shareApproval, setShareApproval] = useState(false)
   const [shareError, setShareError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  // true while a share-modal request (password/approve) is in flight; blocks
+  // double-submits and stale-state races.
+  const [shareBusy, setShareBusy] = useState(false)
   const shareModalRef = useRef<HTMLDivElement>(null)
+  const importInputRef = useRef<HTMLInputElement>(null)
   const shareUrl = window.location.href
 
   async function refreshPending() {
@@ -161,7 +182,8 @@ function RoomChrome({
 
   async function approveUser(userId: string) {
     const token = getHostToken(roomId)
-    if (!token) return
+    if (!token || shareBusy) return
+    setShareBusy(true)
     try {
       await api(`/api/rooms/${roomId}/approve`, {
         method: 'POST',
@@ -171,6 +193,8 @@ function RoomChrome({
       refreshPending()
     } catch {
       // the next refresh will show the truth
+    } finally {
+      setShareBusy(false)
     }
   }
 
@@ -192,7 +216,8 @@ function RoomChrome({
   async function saveSharePassword(e: React.FormEvent) {
     e.preventDefault()
     const token = getHostToken(roomId)
-    if (!token) return
+    if (!token || shareBusy) return
+    setShareBusy(true)
     setShareError(null)
     try {
       const info = await api<RoomInfo>(`/api/rooms/${roomId}`, {
@@ -202,14 +227,21 @@ function RoomChrome({
       })
       setShareInfo(info)
       setSharePassword('')
+      if (info.requiresPassword && !getJoinCookie()) {
+        const t = await hostAutoJoin(roomId)
+        if (t) setJoinCookie(t)
+      }
     } catch (err) {
       setShareError(err instanceof Error ? err.message : 'save failed')
+    } finally {
+      setShareBusy(false)
     }
   }
 
   async function toggleShareApproval() {
     const token = getHostToken(roomId)
-    if (!token) return
+    if (!token || shareBusy) return
+    setShareBusy(true)
     setShareError(null)
     try {
       const info = await api<RoomInfo>(`/api/rooms/${roomId}`, {
@@ -219,10 +251,16 @@ function RoomChrome({
       })
       setShareInfo(info)
       setShareApproval(info.requireApproval)
+      if (info.requiresPassword && !getJoinCookie()) {
+        const t = await hostAutoJoin(roomId)
+        if (t) setJoinCookie(t)
+      }
       if (info.requireApproval) refreshPending()
       else setPending([])
     } catch (err) {
       setShareError(err instanceof Error ? err.message : 'save failed')
+    } finally {
+      setShareBusy(false)
     }
   }
 
@@ -247,16 +285,68 @@ function RoomChrome({
     setClaimKey('')
   }
 
-  // Escape closes the share modal; focus moves onto the panel when it opens.
+  // Escape closes the share modal; focus moves onto the panel when it opens
+  // and returns to the previous element when it closes. Tab wraps inside.
   useEffect(() => {
     if (!shareOpen) return
+    const prevFocus = document.activeElement as HTMLElement | null
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setShareOpen(false)
+      if (e.key === 'Tab') {
+        const modal = shareModalRef.current
+        if (!modal) return
+        const focusables = modal.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+        )
+        if (focusables.length === 0) return
+        const first = focusables[0]!
+        const last = focusables[focusables.length - 1]!
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault()
+          first.focus()
+        }
+      }
     }
     window.addEventListener('keydown', onKey)
     shareModalRef.current?.focus()
-    return () => window.removeEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      prevFocus?.focus()
+    }
   }, [shareOpen])
+
+  // One document-level listener for all three popovers: outside click or Escape
+  // closes them. Clicks inside an open popover or on a toggle button are
+  // ignored (the toggle's own onClick handles it).
+  useEffect(() => {
+    function isInsidePopover(target: EventTarget | null): boolean {
+      if (!(target instanceof Element)) return false
+      return !!(
+        target.closest('.room-menu, .room-pending') || target.closest('[data-popover-toggle]')
+      )
+    }
+    function onPointerDown(e: PointerEvent) {
+      if (isInsidePopover(e.target)) return
+      setProfileOpen(false)
+      setMenuOpen(false)
+      setPendingOpen(false)
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Escape') return
+      setProfileOpen(false)
+      setMenuOpen(false)
+      setPendingOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [])
 
 
   // Pulse the mind icon while the AI is thinking (plan 11.2).
@@ -347,8 +437,13 @@ function RoomChrome({
           <span className="room-badge">You're the host</span>
           <button
             className="room-btn"
+            data-popover-toggle
             onClick={() => {
-              if (!pendingOpen) refreshPending()
+              if (!pendingOpen) {
+                setProfileOpen(false)
+                setMenuOpen(false)
+                refreshPending()
+              }
               setPendingOpen((v) => !v)
             }}
             title="Approve pending join requests"
@@ -365,7 +460,7 @@ function RoomChrome({
                 pending.map((r) => (
                   <div className="room-pending-item" key={r.userId}>
                     <span className="room-pending-name">{r.userName}</span>
-                    <button className="room-btn" onClick={() => approveUser(r.userId)}>
+                    <button className="room-btn" onClick={() => approveUser(r.userId)} disabled={shareBusy}>
                       Approve
                     </button>
                   </div>
@@ -408,10 +503,10 @@ function RoomChrome({
       <button className="room-btn" onClick={exportBoard}>
         Export
       </button>
-      <label className="room-btn">
+      <button className="room-btn" type="button" onClick={() => importInputRef.current?.click()}>
         Import
-        <input type="file" accept=".json,application/json" onChange={importBoard} hidden />
-      </label>
+      </button>
+      <input ref={importInputRef} type="file" accept=".json,application/json" onChange={importBoard} hidden />
       <button
         className="room-icon"
         onClick={onToggleMusic}
@@ -430,8 +525,10 @@ function RoomChrome({
       </button>
       <button
         className="room-icon profile-btn"
+        data-popover-toggle
         onClick={() => {
           setMenuOpen(false)
+          setPendingOpen(false)
           setProfileOpen((v) => !v)
         }}
         aria-expanded={profileOpen}
@@ -499,8 +596,10 @@ function RoomChrome({
       )}
       <button
         className="room-icon room-menu-btn"
+        data-popover-toggle
         onClick={() => {
           setProfileOpen(false)
+          setPendingOpen(false)
           setMenuOpen((v) => !v)
         }}
         aria-expanded={menuOpen}
@@ -607,13 +706,13 @@ function RoomChrome({
                       autoComplete="new-password"
                       aria-label="Room password"
                     />
-                    <button className="room-btn" type="submit">
+                    <button className="room-btn" type="submit" disabled={shareBusy}>
                       Save
                     </button>
                   </form>
                 </div>
                 <label className="room-share-check">
-                  <input type="checkbox" checked={shareApproval} onChange={toggleShareApproval} />
+                  <input type="checkbox" checked={shareApproval} onChange={toggleShareApproval} disabled={shareBusy} />
                   <span>Require host approval to join</span>
                 </label>
                 {shareApproval && (
@@ -628,7 +727,7 @@ function RoomChrome({
                         pending.map((r) => (
                           <div className="room-pending-item" key={r.userId}>
                             <span className="room-pending-name">{r.userName}</span>
-                            <button className="room-btn" onClick={() => approveUser(r.userId)}>
+                            <button className="room-btn" onClick={() => approveUser(r.userId)} disabled={shareBusy}>
                               Approve
                             </button>
                           </div>
@@ -689,6 +788,7 @@ type JoinRequest = { userId: string; userName: string; userColor: string; create
 type RoomPhase =
   | { phase: 'checking' }
   | { phase: 'missing' }
+  | { phase: 'failed' }
   | { phase: 'gate'; info: RoomInfo }
   | { phase: 'pending'; info: RoomInfo }
   | { phase: 'ready'; info: RoomInfo }
@@ -703,6 +803,7 @@ export function Room({ roomId }: { roomId: string }) {
   }, [])
 
   const [phase, setPhase] = useState<RoomPhase>({ phase: 'checking' })
+  const [attempt, setAttempt] = useState(0)
 
   // Room info gates entry: public rooms connect as today; private rooms show
   // the join gate unless a valid join cookie (this room) already exists — the
@@ -710,22 +811,34 @@ export function Room({ roomId }: { roomId: string }) {
   useEffect(() => {
     let cancelled = false
     api<RoomInfo>(`/api/rooms/${roomId}`)
-      .then((info) => {
-        if (cancelled) return
-        if (info.requiresPassword && !getJoinCookie()) setPhase({ phase: 'gate', info })
-        else setPhase({ phase: 'ready', info })
+      .then(async (info) => {
+        if (info.requiresPassword && !getJoinCookie()) {
+          const token = await hostAutoJoin(roomId)
+          if (cancelled) return
+          if (token) setJoinCookie(token)
+          else {
+            setPhase({ phase: 'gate', info })
+            return
+          }
+        }
+        if (!cancelled) setPhase({ phase: 'ready', info })
       })
       .catch((err) => {
-        if (!cancelled && err?.status === 404) setPhase({ phase: 'missing' })
+        if (!cancelled) {
+          if (err?.status === 404) setPhase({ phase: 'missing' })
+          else setPhase({ phase: 'failed' })
+        }
       })
     return () => {
       cancelled = true
     }
-  }, [roomId])
+  }, [roomId, attempt])
 
   const onJoined = useCallback((token: string) => {
     setJoinCookie(token)
-    setPhase((p) => (p.phase === 'gate' ? { phase: 'ready', info: p.info } : p))
+    setPhase((p) =>
+      p.phase === 'gate' || p.phase === 'pending' ? { phase: 'ready', info: p.info } : p
+    )
   }, [])
 
   const onAccessDenied = useCallback(() => {
@@ -747,6 +860,21 @@ export function Room({ roomId }: { roomId: string }) {
           <a className="room-retry" href="#/">
             Create a new board
           </a>
+        </div>
+      )
+    case 'failed':
+      return (
+        <div className="room-status">
+          <p className="room-error">Couldn't reach this room — check your connection.</p>
+          <button
+            className="room-retry"
+            onClick={() => {
+              setPhase({ phase: 'checking' })
+              setAttempt((n) => n + 1)
+            }}
+          >
+            Retry
+          </button>
         </div>
       )
     case 'gate':

@@ -237,29 +237,34 @@ export class AgentService {
 			let maybeIncompleteAction: AgentAction | null = null
 
 			let startTime = Date.now()
-			for await (const text of textStream) {
-				buffer += text
+
+			// ponytail: closeAndParseJson is O(n) over the whole buffer, so running
+			// it on every streamed chunk is O(n²). Throttle attempts to ~30ms; the
+			// final flush below always parses, so trailing actions can't be dropped.
+			let lastAttempt = 0
+			const processBuffer = (): Streaming<AgentAction>[] => {
 				const partialObject = closeAndParseJson(buffer)
-				if (!partialObject) continue
+				if (!partialObject) return []
 
 				const actions = partialObject.actions
-				if (!Array.isArray(actions)) continue
-				if (actions.length === 0) continue
+				if (!Array.isArray(actions)) return []
+				if (actions.length === 0) return []
 
+				const events: Streaming<AgentAction>[] = []
 				// If the events list is ahead of the cursor, we know we've completed the current event
 				// We can complete the event and move the cursor forward
-while (actions.length > cursor) {
-				const action = actions[cursor] as AgentAction
-				if (action) {
-					yield {
-						...action,
-						complete: true,
-						time: Date.now() - startTime,
+				while (actions.length > cursor) {
+					const action = actions[cursor] as AgentAction
+					if (action) {
+						events.push({
+							...action,
+							complete: true,
+							time: Date.now() - startTime,
+						})
+						maybeIncompleteAction = null
 					}
-					maybeIncompleteAction = null
+					cursor++
 				}
-				cursor++
-			}
 
 				// Now let's check the (potentially new) current event
 				// And let's yield it in its (potentially incomplete) state
@@ -273,18 +278,39 @@ while (actions.length > cursor) {
 					maybeIncompleteAction = action
 
 					// Yield the potentially incomplete event
-					yield {
+					events.push({
 						...action,
 						complete: false,
 						time: Date.now() - startTime,
-					}
+					})
+				}
+				return events
+			}
+
+			for await (const text of textStream) {
+				buffer += text
+				const now = Date.now()
+				if (now - lastAttempt < 30) continue
+				lastAttempt = now
+				for (const event of processBuffer()) {
+					yield event
 				}
 			}
 
-			// If we've finished receiving events, but there's still an incomplete event, we need to complete it
-			if (maybeIncompleteAction) {
+			// Final flush: always parse regardless of the throttle window so the
+			// tail of the stream is never skipped.
+			for (const event of processBuffer()) {
+				yield event
+			}
+
+			// If we've finished receiving events, but there's still an incomplete event, we need to complete it.
+			// (The assert defeats declaration-site narrowing: all writes to
+			// maybeIncompleteAction happen inside processBuffer, so CFA thinks it's
+			// still null here and would narrow `if` to never.)
+			const incomplete = maybeIncompleteAction as AgentAction | null
+			if (incomplete) {
 				yield {
-					...maybeIncompleteAction,
+					...incomplete,
 					complete: true,
 					time: Date.now() - startTime,
 				}

@@ -248,11 +248,13 @@ body {
   flex-wrap: wrap;
   justify-content: flex-end;
   max-width: calc(100% - 32px);
-  transition: right 0.3s ease, transform 0.3s ease;
+  /* transform only: animating `right` relayouts the flex bar every frame */
+  transition: transform 0.3s ease;
 }
 
 .room-chrome.panels-open {
-  right: 356px;
+  /* same visual shift as the old right: 16px → 356px, composited instead */
+  transform: translateX(-340px);
 }
 
 /* Desktop: center the room chrome along the top edge. Centering is gated on
@@ -264,13 +266,8 @@ body {
     left: 50%;
     right: auto;
     transform: translateX(-50%);
-    justify-content: safe center;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .room-chrome::-webkit-scrollbar {
-    display: none;
+    justify-content: center;
+    flex-wrap: wrap;
   }
   /* Slide left ~half the 340px right-side panel so the bar clears it. */
   .room-chrome.panels-open {
@@ -279,9 +276,15 @@ body {
 }
 
 @media (max-width: 767px), (max-aspect-ratio: 6/5) {
+  /* Panels are full-screen overlays here; park the chrome underneath and hide
+     it so it can't float above panel content (no slide needed). */
   .room-chrome.panels-open {
     right: 16px;
-    transform: translateX(-340px);
+    transform: none;
+    z-index: 998;
+    opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
   }
 }
 
@@ -1172,8 +1175,19 @@ body {
   cursor: default;
 }
 
+.music-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.music-vol-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
 .music-body {
   padding: 16px;
+  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1194,7 +1208,6 @@ body {
   border-radius: 50%;
   background: repeating-radial-gradient(circle, #0f0f0f 0 2px, #1b1b1b 2px 5px);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
-  will-change: transform;
 }
 
 .music-disc-art {
@@ -1411,6 +1424,11 @@ body {
   padding: 0;
 }
 
+.music-dj-x svg {
+  width: 12px;
+  height: 12px;
+}
+
 .music-dj-x:hover {
   color: var(--text);
 }
@@ -1582,11 +1600,27 @@ body {
     height: 100vh;
     height: 100dvh;
   }
-  /* 44px touch target for the settings control on compact layouts */
+  /* 44px touch targets for icon/text controls on compact layouts */
   .room-menu-btn,
-  .profile-btn {
-    width: 44px;
-    height: 44px;
+  .profile-btn,
+  .music-btn,
+  .music-vol-toggle,
+  .ai-close,
+  .room-modal-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* enlarge the DJ-revoke hit area to ≥44px without changing its visual size */
+  .music-dj-x {
+    padding: 14px 10px;
+    margin: -14px -10px;
+  }
+  /* ≥16px so iOS doesn't zoom-on-focus (desktop keeps the compact look) */
+  .room-input,
+  .ai-input,
+  .ai-model,
+  .room-share-url {
+    font-size: 16px;
   }
 }
 

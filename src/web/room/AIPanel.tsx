@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import type { Editor } from 'tldraw'
@@ -70,6 +70,35 @@ const markdownComponents: Components = {
   },
 }
 
+// Memoized so a streaming flush only re-parses the streaming bubble, not the
+// whole conversation. `tick` busts the memo every 30s so "5m ago" advances.
+const ChatMessage = memo(function ChatMessage({ role, content, ts }: { role: string; content: string; ts: number; tick?: number }) {
+  const me = useUser()
+  const isUser = role === 'user'
+  return (
+    <div className={`ai-msg ai-${role}`}>
+      {isUser ? (
+        <span className="ai-avatar" style={{ background: me.color }} aria-hidden="true">
+          {me.name[0] ?? '?'}
+        </span>
+      ) : (
+        <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
+          <BotGlyph />
+        </span>
+      )}
+      <div className="ai-msg-main">
+        <div className="ai-msg-meta">
+          <span className="ai-msg-name">{isUser ? me.name : 'AI'}</span>
+          <span className="ai-msg-time">{timeAgo(ts)}</span>
+        </div>
+        <div className="ai-msg-body">
+          <ReactMarkdown components={markdownComponents}>{content}</ReactMarkdown>
+        </div>
+      </div>
+    </div>
+  )
+})
+
 export function AIPanel({
   roomId,
   editor,
@@ -91,8 +120,16 @@ export function AIPanel({
   const putAi = (state: AiState) => store.put([state] as any)
   const aiState = useValue('aiState', getAi, [store])
   const [models, setModels] = useState<AiModelInfo[]>([])
+  const [modelsFailed, setModelsFailed] = useState(false)
   const [model, setModel] = useState(() => localStorage.getItem(MODEL_KEY) ?? '')
   const [input, setInput] = useState('')
+  // Re-render periodically so relative timestamps ("5m ago") keep advancing.
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (!open) return
+    const id = window.setInterval(() => setTick((t) => t + 1), 30_000)
+    return () => window.clearInterval(id)
+  }, [open])
   const chatRef = useRef<HTMLDivElement>(null)
   const promptRef = useRef<HTMLTextAreaElement>(null)
   // The conversation has no timestamps; stamp each message on first sight so
@@ -112,7 +149,12 @@ export function AIPanel({
         // Live list unavailable: fall back to the static endpoint behavior.
         api<AiModelsResponse>('/api/ai/models')
           .then((res) => apply(res.models))
-          .catch(() => { if (!cancelled) setModels([]) })
+          .catch(() => {
+            if (!cancelled) {
+              setModels([])
+              setModelsFailed(true)
+            }
+          })
       })
     return () => { cancelled = true }
   }, [])
@@ -126,13 +168,15 @@ export function AIPanel({
   }, [store])
 
   // Follow new content only when already near the bottom — don't yank the
-  // scroll position away from someone who scrolled up to read.
+  // scroll position away from someone who scrolled up to read. Skipped while
+  // closed: scrollHeight/scrollTop reads force sync layout per stream chunk.
   useEffect(() => {
+    if (!open) return
     const el = chatRef.current
     if (!el) return
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [aiState?.conversation, aiState?.streamingText])
+  }, [aiState?.conversation, aiState?.streamingText, open])
 
   const conversation = aiState?.conversation ?? []
   const running = aiState?.status === 'pending' || aiState?.status === 'running'
@@ -140,7 +184,10 @@ export function AIPanel({
   const lockedByOther = !!aiState?.lockedBy && aiState.lockedBy !== me.id
   const canSubmit = !running && !lockedByOther
 
-  const modelName = models.find((m) => m.id === model)?.name ?? (model || DEFAULT_MODEL)
+  const modelsUnavailable = modelsFailed && models.length === 0
+  const modelName = modelsUnavailable
+    ? 'models unavailable'
+    : models.find((m) => m.id === model)?.name ?? (model || DEFAULT_MODEL)
   const statusLine = aiState?.error
     ? 'Error'
     : running
@@ -186,6 +233,7 @@ export function AIPanel({
   }
 
   function clearConversation() {
+    tsByIndex.current = []
     const cur = getAi()
     if (cur) putAi({ ...cur, conversation: [], streamingText: '' })
   }
@@ -224,6 +272,11 @@ export function AIPanel({
             onChange={(e) => setModel(e.target.value)}
             aria-label="Model"
           >
+            {modelsUnavailable && (
+              <option value="" disabled>
+                Models unavailable
+              </option>
+            )}
             {groupModels(models).map(([provider, list]) => (
               <optgroup key={provider} label={PROVIDER_LABELS[provider] ?? provider}>
                 {list.map((m) => (
@@ -243,31 +296,9 @@ export function AIPanel({
       </div>
 
       <div className="ai-chat" ref={chatRef}>
-        {conversation.map((m, i) => {
-          const isUser = m.role === 'user'
-          return (
-            <div key={i} className={`ai-msg ai-${m.role}`}>
-              {isUser ? (
-                <span className="ai-avatar" style={{ background: me.color }} aria-hidden="true">
-                  {me.name[0] ?? '?'}
-                </span>
-              ) : (
-                <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
-                  <BotGlyph />
-                </span>
-              )}
-              <div className="ai-msg-main">
-                <div className="ai-msg-meta">
-                  <span className="ai-msg-name">{isUser ? me.name : 'AI'}</span>
-                  <span className="ai-msg-time">{timeAgo(tsFor(i))}</span>
-                </div>
-                <div className="ai-msg-body">
-                  <ReactMarkdown components={markdownComponents}>{m.content}</ReactMarkdown>
-                </div>
-              </div>
-            </div>
-          )
-        })}
+        {conversation.map((m, i) => (
+          <ChatMessage key={i} role={m.role} content={m.content} ts={tsFor(i)} tick={tick} />
+        ))}
         {running && (
           <div className="ai-msg ai-assistant ai-streaming">
             <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
