@@ -36,9 +36,12 @@ export class AgentService {
 	anthropic: AnthropicProvider
 	google: GoogleGenerativeAIProvider
 	private readonly configured: Record<AgentModelProvider, boolean>
+	/** Providers rejected on the most recent listLiveModels() — lets sync endpoints stay coherent. */
+	lastAuthFailed: AgentModelProvider[] = []
 	private readonly openaiApiKey: string | undefined
 	private readonly openaiBaseUrl: string | undefined
 	private readonly googleApiKey: string | undefined
+	private readonly anthropicApiKey: string | undefined
 
 	constructor(config: AgentServiceConfig) {
 		this.configured = {
@@ -49,6 +52,7 @@ export class AgentService {
 		this.openaiApiKey = config.openaiApiKey
 		this.openaiBaseUrl = config.openaiBaseUrl
 		this.googleApiKey = config.googleApiKey
+		this.anthropicApiKey = config.anthropicApiKey
 		// ponytail: createOpenAI's baseURL accepts any OpenAI-compatible endpoint
 		// (OPENAI_BASE_URL); the plan relies on this to work against proxies.
 		this.openai = createOpenAI({
@@ -85,11 +89,14 @@ export class AgentService {
 	 * definitions and surface liveFailed.
 	 */
 	async listLiveModels(): Promise<{
-		models: { provider: AgentModelProvider; id: string }[]
+		models: { provider: AgentModelProvider; id: string; chat: boolean }[]
 		liveFailed: boolean
+		/** Providers whose key was actively rejected (vs unreachable) — their models must not be offered. */
+		authFailed: AgentModelProvider[]
 	}> {
-		const models: { provider: AgentModelProvider; id: string }[] = []
+		const models: { provider: AgentModelProvider; id: string; chat: boolean }[] = []
 		let liveFailed = false
+		const authFailed: AgentModelProvider[] = []
 		if (this.configured.openai) {
 			try {
 				const base = (this.openaiBaseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
@@ -100,13 +107,15 @@ export class AgentService {
 				if (res.ok) {
 					const body = (await res.json()) as { data?: { id?: string }[] }
 					for (const m of body.data ?? []) {
-						if (m.id && isChatModel('openai', m.id)) {
-							registerLiveModel(m.id, 'openai')
-							models.push({ provider: 'openai', id: m.id })
-						}
+						if (!m.id) continue
+						const chat = isChatModel('openai', m.id)
+						// only chat models become runnable; the rest are listed for visibility
+						if (chat) registerLiveModel(m.id, 'openai')
+						models.push({ provider: 'openai', id: m.id, chat })
 					}
 				} else {
 					liveFailed = true
+					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('openai')
 				}
 			} catch {
 				liveFailed = true
@@ -122,19 +131,44 @@ export class AgentService {
 					const body = (await res.json()) as { models?: { name?: string }[] }
 					for (const m of body.models ?? []) {
 						const id = m.name?.replace(/^models\//, '')
-						if (id && isChatModel('google', id)) {
-							registerLiveModel(id, 'google')
-							models.push({ provider: 'google', id })
-						}
+						if (!id) continue
+						const chat = isChatModel('google', id)
+						if (chat) registerLiveModel(id, 'google')
+						models.push({ provider: 'google', id, chat })
 					}
 				} else {
 					liveFailed = true
+					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('google')
 				}
 			} catch {
 				liveFailed = true
 			}
 		}
-		return { models, liveFailed }
+		// Anthropic exposes a models list (unlike at design time) — probe it so a
+		// rejected ANTHROPIC_API_KEY withholds its defs like every other provider.
+		const anthropicKey = this.anthropicApiKey
+		if (this.configured.anthropic && anthropicKey) {
+			try {
+				const res = await fetch('https://api.anthropic.com/v1/models?limit=100', {
+					headers: { 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+					signal: AbortSignal.timeout(3000),
+				})
+				if (res.ok) {
+					const body = (await res.json()) as { data?: { id?: string }[] }
+					for (const m of body.data ?? []) {
+						if (!m.id) continue
+						registerLiveModel(m.id, 'anthropic')
+						models.push({ provider: 'anthropic', id: m.id, chat: true })
+					}
+				} else {
+					liveFailed = true
+					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('anthropic')
+				}
+			} catch {
+				liveFailed = true
+			}
+		}
+		return { models, liveFailed, authFailed: (this.lastAuthFailed = authFailed) }
 	}
 
 	async *stream(prompt: AgentPrompt): AsyncGenerator<Streaming<AgentAction>> {
@@ -144,7 +178,7 @@ export class AgentService {
 			}
 		} catch (error: any) {
 			log.error('Stream error:', error)
-			throw error
+			throw friendlyStreamError(error)
 		}
 	}
 
@@ -317,7 +351,7 @@ export class AgentService {
 			}
 		} catch (error: any) {
 			log.error('streamActions error:', error)
-			throw error
+			throw friendlyStreamError(error)
 		}
 	}
 }
@@ -327,9 +361,31 @@ type StreamTextProviderOptions = NonNullable<Parameters<typeof streamText>[0]['p
 // ponytail: keep clearly non-text-generation ids out of the chat picker
 // (embeddings, speech, image, moderation, codex, ...). A visible run error
 // beats a picker full of models that can't talk; the filter is cheap.
+// A provider actively rejecting the key (vs being unreachable): OpenAI 401s,
+// Google returns 400 with API_KEY_INVALID in the body.
+function isAuthRejection(status: number, bodyText: string): boolean {
+	return status === 401 || status === 403 || (status === 400 && /API_KEY/i.test(bodyText))
+}
+
+function friendlyStreamError(error: any): Error {
+	const status = error?.statusCode
+	const body = String(error?.responseBody ?? error?.message ?? '')
+	if (isAuthRejection(status ?? 0, body)) {
+		return new Error(
+			'The AI provider rejected the API key — fix OPENAI_API_KEY / GOOGLE_API_KEY in your server .env (note: docker env_file does not expand ${VARS}).'
+		)
+	}
+	return error
+}
+
 function isChatModel(provider: AgentModelProvider, id: string): boolean {
 	if (provider === 'google') {
-		return id.startsWith('gemini') && !/image|audio|tts|customtools|computer-use|live/i.test(id)
+		// Blocklist of non-generateContent families. Everything else that serves
+		// text chat over v1beta generateContent passes (gemini-*, gemma-*, …).
+		// ponytail: new Google model families may need adding here if they 400.
+		return !/embedding|imagen|image|audio|tts|veo|lyria|aqa|nano-banana|\blive\b|computer-use|robotics|deep-research|customtools/i.test(
+			id
+		)
 	}
 	return !/embedding|whisper|tts|dall.?e|audio|realtime|moderation|transcrib|translat|speech|image|codex/i.test(id)
 }

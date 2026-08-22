@@ -149,7 +149,9 @@ app.get('/api/ai/models', (_req, res) => {
   const models: { id: string; name: string; provider: string }[] = Object.entries(
     AGENT_MODEL_DEFINITIONS
   )
-    .filter(([, def]) => configured[def.provider])
+    // lastAuthFailed comes from the boot/live probe — a rejected key must not
+    // advertise models here either (keeps the fallback path coherent).
+    .filter(([, def]) => configured[def.provider] && !service.lastAuthFailed.includes(def.provider))
     .map(([id, def]) => ({ id, name: def.name, provider: def.provider }))
   const envDefault = process.env.OPENAI_DEFAULT_MODEL
   // Only expose a real defined model; an invalid env default (e.g. gpt-4o-mini)
@@ -165,20 +167,24 @@ app.get('/api/ai/models', (_req, res) => {
 // Best-effort: a failed provider fetch falls back to the static defs with
 // liveFailed:true instead of 500ing, and live-only entries carry known:false.
 app.get('/api/ai/models/live', async (_req, res) => {
-  const { models: live, liveFailed } = await service.listLiveModels()
+  const { models: live, liveFailed, authFailed } = await service.listLiveModels()
   const configured: Record<AgentModelProvider, boolean> = {
     openai: !!process.env.OPENAI_API_KEY,
     anthropic: !!process.env.ANTHROPIC_API_KEY,
     google: !!process.env.GOOGLE_API_KEY,
   }
+  // A key that was actively rejected (401/403/API_KEY_INVALID) must not offer
+  // its provider's models — every pick would fail at stream time.
+  const rejected = new Set(authFailed)
   const byId = new Map<string, AiModelInfo>()
   for (const [id, def] of Object.entries(AGENT_MODEL_DEFINITIONS)) {
-    if (configured[def.provider]) byId.set(id, { id, name: def.name, provider: def.provider, known: true })
+    if (configured[def.provider] && !rejected.has(def.provider))
+      byId.set(id, { id, name: def.name, provider: def.provider, known: true })
   }
   for (const m of live) {
-    if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.id, provider: m.provider, known: false })
+    if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.id, provider: m.provider, known: false, chat: m.chat })
   }
-  res.json({ models: [...byId.values()], liveFailed })
+  res.json({ models: [...byId.values()], liveFailed, authFailed })
 })
 
 app.use(express.json())
@@ -216,6 +222,16 @@ scanMusicDir(db)
       log.info(`listening on :${PORT}`)
     })
   })
+
+// Best-effort boot check, fully decoupled from listen: warn loudly when a
+// configured key is present but the provider rejects it — the #1 "AI doesn't
+// work" cause is a bad/placeholder key.
+service.listLiveModels().then(({ authFailed }) => {
+  if (authFailed.includes('openai'))
+    log.warn('OPENAI_API_KEY was rejected by the provider — check the key / OPENAI_BASE_URL in your .env')
+  if (authFailed.includes('google'))
+    log.warn('GOOGLE_API_KEY was rejected by generativelanguage.googleapis.com — check the key in your .env')
+})
 
 // ponytail: fail loudly with a clear line when the port is taken (e.g. the
 // :3000 conflict documented in the README) instead of an unhandled error event.

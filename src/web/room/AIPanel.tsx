@@ -141,7 +141,9 @@ export function AIPanel({
     const apply = (list: AiModelInfo[]) => {
       if (cancelled) return
       setModels(list)
-      setModel((prev) => (list.some((m) => m.id === prev) ? prev : list[0]?.id || DEFAULT_MODEL))
+      // a persisted id that is now chat:false (e.g. embeddings after a filter
+      // fix) must fall back — it would render as a selected-but-disabled option
+      setModel((prev) => (list.some((m) => m.id === prev && m.chat !== false) ? prev : list.find((m) => m.chat !== false)?.id || DEFAULT_MODEL))
     }
     api<AiModelsResponse>('/api/ai/models/live')
       .then((res) => apply(res.models))
@@ -280,8 +282,9 @@ export function AIPanel({
             {groupModels(models).map(([provider, list]) => (
               <optgroup key={provider} label={PROVIDER_LABELS[provider] ?? provider}>
                 {list.map((m) => (
-                  <option key={m.id} value={m.id}>
+                  <option key={m.id} value={m.id} disabled={m.chat === false}>
                     {m.known ? m.name : `${m.id} (live)`}
+                    {m.chat === false ? ' — unsupported' : ''}
                   </option>
                 ))}
               </optgroup>
