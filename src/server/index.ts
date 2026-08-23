@@ -209,7 +209,26 @@ app.post('/api/rooms/:id/ai/cancel', (req, res) => {
 })
 
 const webDist = path.resolve(import.meta.dirname, '../web')
-app.use(express.static(webDist))
+// Hashed assets are immutable (cache forever); index.html must always be
+// revalidated or clients keep running a stale bundle that references assets
+// the next deploy deletes.
+app.use(
+  express.static(webDist, {
+    index: false,
+    setHeaders(res, filePath) {
+      if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache')
+    },
+  })
+)
+const sendIndex = (_req: express.Request, res: express.Response) => {
+  res.setHeader('Cache-Control', 'no-cache')
+  res.sendFile(path.join(webDist, 'index.html'))
+}
+// Final fallback: SPA entry for any unmatched GET.
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return sendIndex(req, res)
+  next()
+})
 
 // Rescan on boot BEFORE listen so the track list is ready for the first
 // client (and so /api/music never races a partially-completed scan).

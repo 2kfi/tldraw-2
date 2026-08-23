@@ -481,18 +481,35 @@ export class AiSession {
 			// Check if a cancel was requested during the pending->running window
 			if (this.stopRequested) return
 			this.stopRequested = false
-			this.putAiState({ ...start, status: 'running', streamingText: '', error: null })
-			const prompt = this.buildPrompt(start, this.resolveModel(start.promptModel))
-			const events = withTimeout(this.service.stream(prompt), RUN_TIMEOUT_MS, this.runAbort.signal)
-			for await (const event of events) {
-				if (event._type === 'message') {
-					assistantText = (event as any).text ?? ''
-					this.scheduleStreamingText(assistantText)
-					continue
+		this.putAiState({ ...start, status: 'running', streamingText: '', error: null })
+		const prompt = this.buildPrompt(start, this.resolveModel(start.promptModel))
+		const events = withTimeout(this.service.stream(prompt), RUN_TIMEOUT_MS, this.runAbort.signal)
+		let lastThought = ''
+		for await (const event of events) {
+			if (event._type === 'message') {
+				assistantText = (event as any).text ?? ''
+				this.scheduleStreamingText(assistantText)
+				continue
+			}
+			if (event._type === 'think') {
+				// Surface reasoning live in the streaming bubble until the actual
+				// reply (message action) replaces it. Models emit think either as
+				// progressive partials or one complete chunk — show both.
+				const thought = (event as any).text
+				if (!assistantText) {
+					if (typeof thought === 'string' && thought) {
+						lastThought = thought
+						this.scheduleStreamingText(thought)
+					}
 				}
-				if (!event.complete) continue
-				const util = this.utils?.[event._type]
-				if (!util) continue
+			}
+			if (!event.complete) continue
+			const util = this.utils?.[event._type]
+			if (!util) {
+				log.warn(`[ai] room ${this.roomId}: no handler for action type "${event._type}"`)
+				continue
+			}
+			log.debug(`[ai] room ${this.roomId}: applying "${event._type}":`, JSON.stringify(event).slice(0, 400))
 				try {
 					const sanitized = util.sanitizeAction(event, this.helpers!)
 					if (sanitized) await util.applyAction(sanitized, this.helpers!, this.runAbort.signal)

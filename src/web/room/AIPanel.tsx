@@ -72,14 +72,31 @@ const markdownComponents: Components = {
 
 // Memoized so a streaming flush only re-parses the streaming bubble, not the
 // whole conversation. `tick` busts the memo every 30s so "5m ago" advances.
-const ChatMessage = memo(function ChatMessage({ role, content, ts }: { role: string; content: string; ts: number; tick?: number }) {
+const ChatMessage = memo(function ChatMessage({
+  role,
+  content,
+  name,
+  color,
+  ts,
+  tick,
+}: {
+  role: string
+  content: string
+  name?: string
+  color?: string
+  ts: number
+  tick?: number
+}) {
   const me = useUser()
   const isUser = role === 'user'
+  // Fall back to the local viewer's identity for messages sent before authors
+  // were stamped onto conversation entries.
+  const author = isUser ? (name ?? me.name) : 'AI'
   return (
     <div className={`ai-msg ai-${role}`}>
       {isUser ? (
-        <span className="ai-avatar" style={{ background: me.color }} aria-hidden="true">
-          {me.name[0] ?? '?'}
+        <span className="ai-avatar" style={{ background: color ?? me.color }} aria-hidden="true">
+          {author[0] ?? '?'}
         </span>
       ) : (
         <span className="ai-avatar ai-avatar-bot" aria-hidden="true">
@@ -88,7 +105,7 @@ const ChatMessage = memo(function ChatMessage({ role, content, ts }: { role: str
       )}
       <div className="ai-msg-main">
         <div className="ai-msg-meta">
-          <span className="ai-msg-name">{isUser ? me.name : 'AI'}</span>
+          <span className="ai-msg-name">{author}</span>
           <span className="ai-msg-time">{timeAgo(ts)}</span>
         </div>
         <div className="ai-msg-body">
@@ -215,7 +232,7 @@ export function AIPanel({
       status: 'pending',
       streamingText: '',
       error: null,
-      conversation: [...cur.conversation, { role: 'user', content: text }],
+      conversation: [...cur.conversation, { role: 'user' as const, content: text, name: me.name, color: me.color }],
       prompt: text,
       promptModel: model || null,
       promptSelection: ctx.selection,
@@ -300,7 +317,7 @@ export function AIPanel({
 
       <div className="ai-chat" ref={chatRef}>
         {conversation.map((m, i) => (
-          <ChatMessage key={i} role={m.role} content={m.content} ts={tsFor(i)} tick={tick} />
+          <ChatMessage key={i} role={m.role} content={m.content} name={m.name} color={m.color} ts={tsFor(i)} tick={tick} />
         ))}
         {running && (
           <div className="ai-msg ai-assistant ai-streaming">

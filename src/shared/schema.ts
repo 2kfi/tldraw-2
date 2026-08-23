@@ -16,6 +16,9 @@ export const aiStateValidator = T.object({
     T.object({
       role: T.literalEnum('user', 'assistant'),
       content: T.string,
+      // Author display info so remote users' messages show who wrote them.
+      name: T.string.optional(),
+      color: T.string.optional(),
     })
   ),
   error: T.string.nullable(),
@@ -59,7 +62,7 @@ export type AiState = {
   lockedByName: string | null
   status: 'idle' | 'pending' | 'running' | 'error'
   streamingText: string
-  conversation: Array<{ role: 'user' | 'assistant'; content: string }>
+  conversation: Array<{ role: 'user' | 'assistant'; content: string; name?: string; color?: string }>
   error: string | null
   prompt: string | null
   promptModel: string | null

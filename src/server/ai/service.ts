@@ -198,30 +198,25 @@ export class AgentService {
 		const modelDefinition = getAgentModelDefinition(modelId)
 		const systemPrompt = buildSystemPrompt(prompt)
 
-		// Build messages with provider-specific options
-		const messages: ModelMessage[] = []
+		// The AI SDK prefers the `system` option (system-in-messages is flagged as
+		// an injection risk). Anthropic is the exception: cacheControl breakpoints
+		// need a system message, so it keeps one — with the SDK's opt-in flag.
+		const usesSystemMessage = provider === 'anthropic.messages'
+		const system = usesSystemMessage ? undefined : systemPrompt
 
-		// Add system prompt with Anthropic caching if applicable
-		if (provider === 'anthropic.messages') {
-			// Anthropic requires explicit cache breakpoints. We set one at the end of the
-			// system prompt to cache all system content (which generally changes together).
-			messages.push({
+		// Prompt messages
+		const messages: ModelMessage[] = buildMessages(prompt)
+		if (usesSystemMessage) {
+			// Anthropic requires explicit cache breakpoints. We set one at the end of
+			// the system prompt to cache all system content (which generally changes together).
+			messages.unshift({
 				role: 'system',
 				content: systemPrompt,
 				providerOptions: {
 					anthropic: { cacheControl: { type: 'ephemeral' } },
 				},
 			})
-		} else {
-			messages.push({
-				role: 'system',
-				content: systemPrompt,
-			})
 		}
-
-		// Add prompt messages
-		const promptMessages = buildMessages(prompt)
-		messages.push(...promptMessages)
 
 		// Check for debug flags and log if enabled
 		const debugPart = prompt.debug as DebugPart | undefined
@@ -231,7 +226,7 @@ export class AgentService {
 				log.debug('[DEBUG] System Prompt (without schema):\n', promptWithoutSchema)
 			}
 			if (debugPart.logMessages) {
-				log.debug('[DEBUG] Messages:\n', JSON.stringify(promptMessages, null, 2))
+				log.debug('[DEBUG] Messages:\n', JSON.stringify(messages, null, 2))
 			}
 		}
 
@@ -239,20 +234,23 @@ export class AgentService {
 		// Opus 4.7+ and Sonnet 4.6 reject last-assistant-turn prefills (400), so skip it there.
 		// Only anthropic/google providers accept a prefill the parse buffer can rely on;
 		// OpenAI continues mid-JSON and never re-emits the prefix, so it must start empty.
+		const PREFILL = '{"actions": [{"_type":'
 		const canForceResponseStart =
 			(provider === 'anthropic.messages' || provider === 'google.generative-ai') &&
 			modelDefinition.supportsPrefill
 		if (canForceResponseStart) {
 			messages.push({
 				role: 'assistant',
-				content: '{"actions": [{"_type":',
+				content: PREFILL,
 			})
 		}
 
 		try {
-			const { textStream } = streamText({
+			const result = streamText({
 				model,
+				system,
 				messages,
+				allowSystemInMessages: usesSystemMessage,
 				maxOutputTokens: 8192,
 				// Opus 4.7+ removed `temperature` (and top_p/top_k); sending it returns a 400.
 				...(modelDefinition.supportsTemperature ? { temperature: 0 } : {}),
@@ -265,6 +263,7 @@ export class AgentService {
 					throw e
 				},
 			})
+			const { textStream } = result
 
 			let buffer = ''
 			let cursor = 0
@@ -277,7 +276,12 @@ export class AgentService {
 			// final flush below always parses, so trailing actions can't be dropped.
 			let lastAttempt = 0
 			const processBuffer = (): Streaming<AgentAction>[] => {
-				const partialObject = closeAndParseJson(buffer)
+				// With a prefill the model continues mid-JSON, so the raw stream is
+				// missing its opening `{"actions": [{"_type":` — re-attach it unless
+				// the model ignored the prefill and started a fresh object itself.
+				const parseInput =
+					canForceResponseStart && !/^\s*\{/.test(buffer) ? PREFILL + buffer : buffer
+				const partialObject = closeAndParseJson(parseInput)
 				if (!partialObject) return []
 
 				const actions = partialObject.actions
@@ -348,6 +352,14 @@ export class AgentService {
 					complete: true,
 					time: Date.now() - startTime,
 				}
+			}
+
+			// Silent-failure guard: a stream that yields nothing (e.g. all tokens
+			// eaten by thinking, or an unparseable shape) must be visible in logs.
+			if (cursor === 0) {
+				log.warn(
+					`streamActions: 0 actions parsed (finish=${await result.finishReason}) model=${modelId}`
+				)
 			}
 		} catch (error: any) {
 			log.error('streamActions error:', error)

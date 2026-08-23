@@ -650,16 +650,25 @@ body {
   background-color: transparent;
 }
 
+/* Camera-follow vars are set from Room.tsx on every camera change; defaults
+   keep the pattern sane before the editor mounts. */
+.room-canvas.canvas-bg-graph,
+.room-canvas.canvas-bg-dots {
+  --grid-px: 0px;
+  --grid-py: 0px;
+  --grid-z: 1;
+  background-size: calc(var(--grid-size) * var(--grid-z)) calc(var(--grid-size) * var(--grid-z));
+  background-position: var(--grid-px) var(--grid-py);
+}
+
 .room-canvas.canvas-bg-graph {
   background-image:
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: var(--grid-size) var(--grid-size);
 }
 
 .room-canvas.canvas-bg-dots {
   background-image: radial-gradient(circle, var(--grid-dot) 1px, transparent 1.5px);
-  background-size: var(--grid-size) var(--grid-size);
 }
 
 /* dim layer behind a full-screen panel in compact mode; hidden on desktop */

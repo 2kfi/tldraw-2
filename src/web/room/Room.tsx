@@ -1136,12 +1136,32 @@ function RoomCanvas({
     }
   }, [editor])
 
+  // The dot/grid backgrounds are CSS patterns on the wrapper div; without
+  // this they sit still while the canvas pans and zooms underneath. Mirror
+  // the camera into CSS vars so the pattern moves in world coordinates.
+  const canvasElRef = useRef<HTMLDivElement>(null)
+  const bgFollowsCamera = bg !== 'none'
+  useEffect(() => {
+    if (!editor || !bgFollowsCamera) return
+    const el = canvasElRef.current
+    if (!el) return
+    const update = () => {
+      const { x, y, z } = editor.getCamera()
+      el.style.setProperty('--grid-px', `${(-x * z).toFixed(2)}px`)
+      el.style.setProperty('--grid-py', `${(-y * z).toFixed(2)}px`)
+      el.style.setProperty('--grid-z', String(z))
+    }
+    update()
+    return editor.store.listen(update, { source: 'user', scope: 'session' })
+  }, [editor, bgFollowsCamera])
+
   return (
     <div className="room">
       <div className="room-layout">
         {isCompact && (aiOpen || musicOpen) && <div className="panel-backdrop" onClick={closePanels} />}
         {editor && <AIPanel editor={editor} roomId={roomId} open={aiOpen} onClose={() => setAiOpen(false)} />}
         <div
+          ref={canvasElRef}
           className={`room-canvas${
             bg === 'graph' ? ' canvas-bg-graph' : bg === 'dots' ? ' canvas-bg-dots' : ''
           }`}
