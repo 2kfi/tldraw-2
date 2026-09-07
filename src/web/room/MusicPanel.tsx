@@ -4,11 +4,12 @@ import { useValue } from 'tldraw'
 import gsap from 'gsap'
 import { MUSIC_STATE_ID, createDefaultMusicState } from '../../shared/schema'
 import type { MusicState } from '../../shared/schema'
-import type { MusicTrackInfo, MusicTracksResponse } from '../../shared/types'
+import type { MusicProposal, MusicProposalsResponse, MusicTrackInfo, MusicTracksResponse } from '../../shared/types'
 import { api } from '../lib/api'
-import { getHostKey, getHostToken } from '../lib/host'
+import { getHostToken, useIsHost } from '../lib/host'
 import { useUser } from '../lib/user'
 import { usePanelSlide } from '../lib/usePanelSlide'
+import { useFocusTrap } from '../lib/useFocusTrap'
 
 function fmt(s: number): string {
   if (!Number.isFinite(s) || s < 0) return '0:00'
@@ -91,11 +92,13 @@ export function MusicPanel({
 }) {
   const store = editor.store
   const me = useUser()
-  // localStorage + JSON.parse per render adds up; the host key only changes on
-  // claim (which reloads state), so memoize per roomId.
-  const isHost = useMemo(() => getHostKey(roomId) !== null, [roomId])
+  // Reactive host check: updates on claim via t2:host-changed/storage.
+  const isHost = useIsHost(roomId)
   const panelRef = useRef<HTMLDivElement>(null)
   usePanelSlide(panelRef, 'right', open)
+  // Focus trap matches the share modal: Escape closes, Tab wraps, focus
+  // returns to the toggle when the panel closes.
+  useFocusTrap(panelRef, open, onClose)
 
   // ponytail: validated at the sync boundary; the store's branded ids don't know
   // custom records, so cast (same pattern as AIPanel).
@@ -107,10 +110,22 @@ export function MusicPanel({
   const joinedRef = useRef(joined)
   joinedRef.current = joined
   const [tracks, setTracks] = useState<MusicTrackInfo[]>([])
+  const [loading, setLoading] = useState(true)
+  const [query, setQuery] = useState('')
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [opError, setOpError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [drag, setDrag] = useState<number | null>(null)
   const [playbackError, setPlaybackError] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadMsg, setUploadMsg] = useState<string | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+  const [proposals, setProposals] = useState<MusicProposal[]>([])
+  const [proposalsError, setProposalsError] = useState<string | null>(null)
+  const [proposing, setProposing] = useState(false)
+  const [proposeMsg, setProposeMsg] = useState<string | null>(null)
+  const [previewId, setPreviewId] = useState<string | null>(null)
+  const previewRef = useRef<HTMLAudioElement | null>(null)
 
   // per-browser volume (local only — never synced to the room)
   const [volume, setVolume] = useState(() => {
@@ -124,11 +139,29 @@ export function MusicPanel({
   const tweenRef = useRef<gsap.core.Tween | null>(null)
   const seekingRef = useRef(false)
 
-  // apply the local volume to the shared <audio> element; purely per-browser
+  // apply the local volume to the shared <audio> element and the private
+  // preview element; purely per-browser
   useEffect(() => {
+    const v = muted ? 0 : volume / 100
     const audio = audioRef.current
-    if (audio) audio.volume = muted ? 0 : volume / 100
+    if (audio) audio.volume = v
+    if (previewRef.current) previewRef.current.volume = v
   }, [volume, muted])
+
+  // Private audition element: guests preview tracks locally without touching
+  // room state. Stops on unmount + when the panel closes (the panel stays
+  // mounted and only hides, so close would otherwise leak audio).
+  useEffect(() => () => {
+    previewRef.current?.pause()
+    previewRef.current = null
+  }, [])
+
+  useEffect(() => {
+    if (!open) {
+      previewRef.current?.pause()
+      setPreviewId(null)
+    }
+  }, [open])
 
   function setVolumeAndPersist(v: number) {
     setVolume(v)
@@ -150,6 +183,10 @@ export function MusicPanel({
   }
 
   const canControl = isHost || (music?.allowedMemberIds ?? []).includes(me.id)
+  // onEnded fires from a stale closure — mirror canControl into a ref so only
+  // a current host/DJ advances the room (single writer, drift §4).
+  const canControlRef = useRef(canControl)
+  canControlRef.current = canControl
 
   // Only subscribe while the panel is open: the compute touches the store
   // conditionally, so closed panels track no signals and never re-render on
@@ -169,6 +206,13 @@ export function MusicPanel({
 
   const trackById = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks])
   const current = music?.currentTrackId ? trackById.get(music.currentTrackId) : undefined
+  const previewTrack = previewId ? trackById.get(previewId) : undefined
+
+  const q = query.trim().toLowerCase()
+  const visible = useMemo(
+    () => (q ? tracks.filter((t) => `${t.title} ${t.artist} ${t.album}`.toLowerCase().includes(q)) : tracks),
+    [tracks, q]
+  )
 
   function currentPos(state: MusicState): number {
     if (state.playing && state.startedAt) return state.positionMs + (Date.now() - state.startedAt)
@@ -178,8 +222,8 @@ export function MusicPanel({
   useEffect(() => {
     let cancelled = false
     api<MusicTracksResponse>('/api/music')
-      .then((res) => { if (!cancelled) setTracks(res.tracks) })
-      .catch(() => { if (!cancelled) setTracks([]) })
+      .then((res) => { if (!cancelled) { setTracks(res.tracks); setLoading(false) } })
+      .catch(() => { if (!cancelled) { setTracks([]); setLoading(false) } })
     return () => { cancelled = true }
   }, [])
 
@@ -197,7 +241,20 @@ export function MusicPanel({
       const pos = currentPos(music) / 1000
       setProgress((prev) => (prev === pos ? prev : pos))
     }, 250)
-    return () => window.clearInterval(id)
+    // Drift §4: the 0.35s snap only fires on record changes, so a clock that
+    // wanders mid-track is pulled back gently every 5s (1s tolerance).
+    const slow = window.setInterval(() => {
+      const m = getMusic()
+      const audio = audioRef.current
+      if (!open || !m?.playing || !joinedRef.current || seekingRef.current || !audio) return
+      if (!Number.isFinite(audio.duration)) return
+      const pos = currentPos(m) / 1000
+      if (Math.abs(audio.currentTime - pos) > 1) audio.currentTime = pos
+    }, 5000)
+    return () => {
+      window.clearInterval(id)
+      window.clearInterval(slow)
+    }
   }, [music, open])
 
   // GSAP disc: continuous rotation while playing, paused otherwise. CSS can't
@@ -220,7 +277,8 @@ export function MusicPanel({
       tween.pause()
       return
     }
-    tween.restart()
+    // play() resumes from the current angle — restart() would snap the disc
+    // back to 0° on every pause/resume and panel toggle.
     tween.play()
   }, [music?.playing, joined, open])
 
@@ -237,7 +295,7 @@ export function MusicPanel({
       if (!joined) return // awaiting a gesture — the Join playback button shows
       if (!seekingRef.current) {
         if (Math.abs(audio.currentTime - pos) > 0.35 && Number.isFinite(audio.duration)) audio.currentTime = pos
-        if (audio.paused) audio.play().catch(() => { setPlaybackError('Playback failed — click any track, then press play.'); write({ playing: false }) })
+        if (audio.paused) audio.play().catch(() => { setPlaybackError('Playback failed — click any track, then press play.'); if (getMusic()?.playing) void op({ op: 'toggle' }) })
       }
     } else {
       audio.pause()
@@ -245,49 +303,45 @@ export function MusicPanel({
     }
   }, [music, joined])
 
-  function write(next: Partial<MusicState>) {
-    const cur = getMusic() ?? createDefaultMusicState(me.id)
-    putMusic({ ...cur, ...next, updatedBy: me.id })
+  // All control writes go through PUT /api/music/state: the server checks
+  // host-or-DJ, stamps startedAt on its own clock, and applies via updateStore
+  // — the TLSync record is a read replica. Never putMusic() control state
+  // directly (a 403/409 leaves the record untouched and surfaces opError).
+  async function op(body: Record<string, unknown>) {
+    const token = getHostToken(roomId)
+    try {
+      const res = await api<{ state: MusicState }>('/api/music/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Host-Token': token } : {}) },
+        body: JSON.stringify({ roomId, ...body }),
+      })
+      putMusic(res.state)
+      setOpError(null)
+    } catch (err) {
+      setOpError(err instanceof Error ? err.message : 'control failed')
+    }
   }
 
   function playTrack(trackId: string) {
     setPlaybackError(null)
     setJoined(true)
-    const cur = getMusic() ?? createDefaultMusicState(me.id)
-    const queue = cur.queue.length ? [...cur.queue] : tracks.map((t) => t.id)
-    if (!queue.includes(trackId)) queue.push(trackId)
-    putMusic({ ...cur, currentTrackId: trackId, queue, playing: true, startedAt: Date.now(), positionMs: 0, updatedBy: me.id })
+    void op({ op: 'play', trackId })
   }
 
   function togglePlay() {
     setPlaybackError(null)
     const cur = getMusic()
-    if (!cur) return
-    if (cur.playing) {
-      putMusic({ ...cur, playing: false, startedAt: null, positionMs: currentPos(cur), updatedBy: me.id })
-    } else if (cur.currentTrackId) {
-      putMusic({ ...cur, playing: true, startedAt: Date.now(), positionMs: cur.positionMs, updatedBy: me.id })
-    }
+    if (!cur || (!cur.playing && !cur.currentTrackId)) return
+    void op({ op: 'toggle' })
   }
 
   function step(delta: number) {
     setPlaybackError(null)
-    const cur = getMusic()
-    if (!cur?.currentTrackId) return
-    const queue = cur.queue.length ? cur.queue : tracks.map((t) => t.id)
-    const idx = queue.indexOf(cur.currentTrackId)
-    // current track was removed by a rescan (idx -1) or the queue is empty:
-    // stepping is a no-op instead of wrapping onto the wrong track.
-    if (queue.length === 0 || idx < 0) return
-    const next = queue[(idx + delta + queue.length) % queue.length]
-    if (next) playTrack(next)
+    void op({ op: 'step', delta })
   }
 
   function seekTo(ms: number) {
-    const cur = getMusic()
-    if (!cur) return
-    const playing = cur.playing
-    putMusic({ ...cur, positionMs: ms, startedAt: playing ? Date.now() : null, updatedBy: me.id })
+    void op({ op: 'seek', positionMs: Math.max(0, Math.round(ms)) })
   }
 
   function commitSeek(value: string) {
@@ -311,27 +365,124 @@ export function MusicPanel({
     return () => window.removeEventListener('pointerup', onUp)
   }, [drag])
 
+  async function loadProposals() {
+    const token = getHostToken(roomId)
+    if (!token) return
+    try {
+      const res = await api<MusicProposalsResponse>(`/api/music/proposals?room=${encodeURIComponent(roomId)}`, {
+        headers: { 'X-Host-Token': token },
+      })
+      setProposals(res.proposals)
+      setProposalsError(null)
+    } catch (err) {
+      setProposalsError(err instanceof Error ? err.message : 'could not load suggestions')
+    }
+  }
+
+  // Hosts load pending guest suggestions whenever the panel opens.
+  useEffect(() => {
+    if (open && isHost) void loadProposals()
+  }, [open, isHost])
+
+  async function reloadTracks() {
+    const res = await api<MusicTracksResponse>('/api/music')
+    setTracks(res.tracks)
+  }
+
   function refresh() {
     const token = getHostToken(roomId)
     if (!token) return
     setRefreshError(null)
-    const cancelledRef = { current: false }
-    api<MusicTracksResponse>('/api/music/refresh', {
+    api<MusicTracksResponse>(`/api/music/refresh?room=${encodeURIComponent(roomId)}`, {
       method: 'POST',
       headers: { 'X-Host-Token': token },
     })
-      .then(() => api<MusicTracksResponse>('/api/music'))
-      .then((res) => { if (!cancelledRef.current) setTracks(res.tracks) })
-      .catch((err) => { if (!cancelledRef.current) setRefreshError(err instanceof Error ? err.message : 'refresh failed') })
-    return () => { cancelledRef.current = true }
+      .then(() => reloadTracks())
+      .then(() => loadProposals())
+      .catch((err) => setRefreshError(err instanceof Error ? err.message : 'refresh failed'))
+  }
+
+  async function uploadFiles(files: FileList | File[]) {
+    const token = getHostToken(roomId)
+    if (!token) return
+    const list = [...files].filter((f) => f.size > 0)
+    if (!list.length) return
+    setUploading(true)
+    setUploadMsg(null)
+    try {
+      for (const f of list) {
+        const fd = new FormData()
+        fd.append('file', f)
+        await api(`/api/music/upload?room=${encodeURIComponent(roomId)}`, {
+          method: 'POST',
+          headers: { 'X-Host-Token': token },
+          body: fd,
+        })
+      }
+      await reloadTracks()
+      setUploadMsg(list.length === 1 ? 'Track added to the library.' : `${list.length} tracks added to the library.`)
+    } catch (err) {
+      setUploadMsg(err instanceof Error ? err.message : 'upload failed')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function proposeFile(f: File | undefined) {
+    if (!f || f.size === 0) return
+    setProposing(true)
+    setProposeMsg(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      await api('/api/music/propose', { method: 'POST', body: fd })
+      setProposeMsg('Sent to the host — it appears in the library once approved.')
+    } catch (err) {
+      setProposeMsg(err instanceof Error ? err.message : 'suggestion failed')
+    } finally {
+      setProposing(false)
+    }
+  }
+
+  async function decideProposal(id: string, approve: boolean) {
+    const token = getHostToken(roomId)
+    if (!token) return
+    setProposalsError(null)
+    try {
+      await api(`/api/music/proposals/${id}/${approve ? 'approve' : 'reject'}?room=${encodeURIComponent(roomId)}`, {
+        method: 'POST',
+        headers: { 'X-Host-Token': token },
+      })
+      await reloadTracks()
+      await loadProposals()
+    } catch (err) {
+      setProposalsError(err instanceof Error ? err.message : 'decision failed')
+    }
   }
 
   function toggleDJ(rawUserId: string) {
     const cur = getMusic() ?? createDefaultMusicState(me.id)
-    const set = new Set(cur.allowedMemberIds)
-    if (set.has(rawUserId)) set.delete(rawUserId)
-    else set.add(rawUserId)
-    putMusic({ ...cur, allowedMemberIds: [...set], updatedBy: me.id })
+    void op({ op: 'dj', userId: rawUserId, grant: !cur.allowedMemberIds.includes(rawUserId) })
+  }
+
+  function togglePreview(t: MusicTrackInfo) {
+    let el = previewRef.current
+    if (!el) {
+      el = new Audio()
+      el.preload = 'none'
+      el.onended = () => setPreviewId(null)
+      previewRef.current = el
+    }
+    if (previewId === t.id) {
+      el.pause()
+      setPreviewId(null)
+      return
+    }
+    el.src = `/media/track/${t.id}`
+    el.volume = muted ? 0 : volume / 100
+    el.play()
+      .then(() => setPreviewId(t.id))
+      .catch(() => setPlaybackError('Preview failed — try again.'))
   }
 
   function nameFor(rawUserId: string): string {
@@ -341,7 +492,7 @@ export function MusicPanel({
   }
 
   return (
-    <aside className="music-panel" ref={panelRef}>
+    <aside className="music-panel" ref={panelRef} aria-label="Music" tabIndex={-1}>
       <div className="music-header">
         <div className="music-title">
           <span>Music</span>
@@ -411,6 +562,8 @@ export function MusicPanel({
               step={0.1}
               value={drag ?? progress}
               disabled={!canControl}
+              aria-label="Seek position"
+              aria-valuetext={`${fmt(drag ?? progress)} of ${fmt(current.duration)}`}
               onChange={(e) => {
                 seekingRef.current = true
                 setDrag(Number(e.target.value))
@@ -444,26 +597,143 @@ export function MusicPanel({
           </div>
         )}
 
-        <div className="music-queue">
-          {tracks.map((t) => (
-            <button
-              key={t.id}
-              className={`music-track${t.id === music?.currentTrackId ? ' active' : ''}`}
-              onClick={() => playTrack(t.id)}
-              disabled={!canControl}
-            >
-              <span className="music-track-title2">{t.title}</span>
-              <span className="music-track-artist2">
-                {[t.artist, t.album].filter(Boolean).join(' · ') || fmt(t.duration)}
-              </span>
+        <div className="music-search">
+          <input
+            className="music-search-input"
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search title, artist, album"
+            aria-label="Search tracks"
+          />
+          {query && (
+            <button className="music-btn music-search-clear" onClick={() => setQuery('')} aria-label="Clear search">
+              <IconX />
             </button>
-          ))}
-          {tracks.length === 0 && (
-            <div className="music-empty">
-              No tracks found. Drop audio files into the music folder, then hit Refresh.
-            </div>
           )}
         </div>
+
+        {isHost && (
+          <div
+            className={`music-drop${dragOver ? ' over' : ''}`}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => { e.preventDefault(); setDragOver(false); void uploadFiles(e.dataTransfer.files) }}
+          >
+            <label className="music-drop-label">
+              <input
+                className="music-drop-input"
+                type="file"
+                accept="audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav,.aac"
+                multiple
+                disabled={uploading}
+                onChange={(e) => { void uploadFiles(e.target.files ?? []); e.target.value = '' }}
+              />
+              <span>{uploading ? 'Uploading…' : 'Drop audio here or browse to add it to the library'}</span>
+            </label>
+            {uploadMsg && <div className="music-hint">{uploadMsg}</div>}
+          </div>
+        )}
+
+        <div className="music-queue" aria-busy={loading}>
+          {loading && (
+            <>
+              <span className="sr-only" role="status">Loading tracks…</span>
+              <div className="music-skeletons" aria-hidden="true">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} className="music-skeleton">
+                    <span className="music-skeleton-line w60" />
+                    <span className="music-skeleton-line w40" />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {!loading && visible.map((t) => {
+            const previewing = t.id === previewId
+            return (
+              <button
+                key={t.id}
+                className={`music-track${t.id === music?.currentTrackId ? ' active' : ''}${previewing ? ' previewing' : ''}`}
+                onClick={() => (canControl ? playTrack(t.id) : togglePreview(t))}
+                aria-label={
+                  canControl
+                    ? `Play ${t.title} in the room`
+                    : previewing
+                      ? `Stop previewing ${t.title}`
+                      : `Preview ${t.title} privately (only you hear this)`
+                }
+              >
+                <span className="music-track-title2">{t.title}</span>
+                <span className="music-track-artist2">
+                  {[t.artist, t.album].filter(Boolean).join(' · ') || fmt(t.duration)}
+                </span>
+              </button>
+            )
+          })}
+          {!loading && tracks.length === 0 && (
+            <div className="music-empty">
+              {isHost
+                ? 'No tracks yet — drop audio above to start the library.'
+                : 'The library is empty. Suggest a track below and the host can add it.'}
+            </div>
+          )}
+          {!loading && tracks.length > 0 && visible.length === 0 && (
+            <div className="music-empty">No tracks match “{query.trim()}”.</div>
+          )}
+        </div>
+        {!canControl && !loading && tracks.length > 0 && (
+          <div className="music-hint">Tap a track to preview it privately — only the host or a DJ plays to the room.</div>
+        )}
+        {previewTrack && (
+          <div className="music-hint">Previewing “{previewTrack.title}” privately — only you hear this. Tap it again to stop.</div>
+        )}
+
+        {!isHost && (
+          <div className="music-suggest">
+            <div className="music-djs-title">Suggest a track</div>
+            <label className="music-btn music-suggest-label">
+              <input
+                className="music-drop-input"
+                type="file"
+                accept="audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav,.aac"
+                disabled={proposing}
+                onChange={(e) => { void proposeFile(e.target.files?.[0]); e.target.value = '' }}
+              />
+              <span>{proposing ? 'Sending…' : 'Choose audio to suggest'}</span>
+            </label>
+            {proposeMsg && <div className="music-hint">{proposeMsg}</div>}
+          </div>
+        )}
+
+        {isHost && (
+          <div className="music-djs">
+            <div className="music-djs-title">
+              Suggested tracks{proposals.length > 0 ? ` (${proposals.length})` : ''}
+            </div>
+            {proposals.length === 0 ? (
+              <div className="music-empty">Nothing waiting — guest suggestions will appear here for approval.</div>
+            ) : (
+              proposals.map((p) => (
+                <div key={p.id} className="music-proposal">
+                  <span className="music-proposal-name">
+                    {p.origName}
+                    <span className="music-proposal-by"> · {p.submittedByName}</span>
+                  </span>
+                  <span className="music-proposal-actions">
+                    <button className="music-btn" onClick={() => void decideProposal(p.id, true)}>
+                      Approve
+                    </button>
+                    <button className="music-btn" onClick={() => void decideProposal(p.id, false)}>
+                      Reject
+                    </button>
+                  </span>
+                </div>
+              ))
+            )}
+            {proposalsError && <div className="music-status-error">{proposalsError}</div>}
+          </div>
+        )}
 
         <div className="music-djs">
           <div className="music-djs-title">DJs</div>
@@ -493,6 +763,7 @@ export function MusicPanel({
           </div>
         </div>
         {playbackError && <div className="music-status-error">{playbackError}</div>}
+        {opError && <div className="music-status-error">{opError}</div>}
         {refreshError && <div className="music-status-error">{refreshError}</div>}
       </div>
 
@@ -505,13 +776,11 @@ export function MusicPanel({
           if (a && m && joinedRef.current && Number.isFinite(a.duration)) a.currentTime = currentPos(m) / 1000
         }}
         onEnded={() => {
-          const m = getMusic()
-          if (!m?.currentTrackId) return
-          const queue = m.queue.length ? m.queue : tracks.map((t) => t.id)
-          const idx = queue.indexOf(m.currentTrackId)
-          if (queue.length === 0 || idx < 0) return
-          const next = queue[(idx + 1) % queue.length]
-          if (next) playTrack(next)
+          // Single writer: only a current host/DJ advances the room. Guests let
+          // their audio end and follow the record — every joined client writing
+          // here raced and skipped tracks.
+          if (!canControlRef.current) return
+          void op({ op: 'step', delta: 1 })
         }}
       />
     </aside>

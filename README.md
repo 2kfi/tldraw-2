@@ -11,6 +11,8 @@ See `plan.md` for the full design (single source of truth).
 ```bash
 cp .env.example .env      # set OPENAI_API_KEY (and optionally ANTHROPIC/GOOGLE keys); OPENAI_DEFAULT_MODEL must be a valid AGENT_MODEL_DEFINITIONS id
 mkdir -p data music       # drop audio files into ./music (mounted read-only); local dev reads ./data/music (or set MUSIC_DIR)
+# SESSION_SECRET is required for compose (production boot refuses the dev
+# default):  openssl rand -base64 32  → put it in .env as SESSION_SECRET=...
 docker compose up --build
 ```
 

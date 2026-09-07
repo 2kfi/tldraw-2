@@ -16,6 +16,8 @@ export type AiModelInfo = {
 
 export type AiModelsResponse = {
   models: AiModelInfo[]
+  /** Single shared default the server runner uses (Google-first). */
+  defaultModel?: string
   /** True when a configured provider's live model fetch failed (static defs still returned). */
   liveFailed?: boolean
   /** Providers whose configured key was actively rejected (401/403/API_KEY_INVALID). Their models are withheld. */
@@ -34,4 +36,16 @@ export type MusicTrackInfo = {
 export type MusicTracksResponse = {
   tracks: MusicTrackInfo[]
   scannedAt: number
+}
+
+export type MusicProposal = {
+  id: string
+  origName: string
+  submittedByName: string
+  createdAt: number
+  status: string
+}
+
+export type MusicProposalsResponse = {
+  proposals: MusicProposal[]
 }

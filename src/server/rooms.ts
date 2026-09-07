@@ -1,13 +1,17 @@
 import { createHmac, createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { rmSync } from 'node:fs'
+import path from 'node:path'
 import { Router } from 'express'
 import type { Database } from 'better-sqlite3'
 import { z } from 'zod'
+import { DATA_DIR, SESSION_SECRET } from './config'
+import { log } from './log'
 import { createRoomId } from '../shared/ids'
 import type { UserInfo } from '../shared/types'
 
 const HOST_KEY_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
-const SECRET = process.env.SESSION_SECRET ?? 'dev-secret-change-me'
+const SECRET = SESSION_SECRET
 const DEFAULT_NAME = 'Untitled board'
 
 export type UserParser = (req: { headers: Record<string, string | string[] | undefined> }) => UserInfo
@@ -60,24 +64,38 @@ function hashMatches(presented: string, roomId: string, stored: string): boolean
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
-// --- host tokens (HMAC-SHA256 over roomId + userId + exp, stateless) ---
+// --- host tokens (HMAC-SHA256 over roomId + userId + exp + kind, stateless) ---
+// kind separates privileges: 'host' grants management APIs, 'join' only proves
+// room access (WS gate, DJ caller id). requireHostToken rejects join tokens.
 
 export function issueHostToken(roomId: string, userId: string): string {
   const exp = Date.now() + TOKEN_TTL_MS
-  const sig = createHmac('sha256', SECRET).update(`${roomId}.${userId}.${exp}`).digest('base64url')
-  return `${roomId}.${userId}.${exp}.${sig}`
+  const sig = createHmac('sha256', SECRET).update(`${roomId}.${userId}.${exp}.host`).digest('base64url')
+  return `${roomId}.${userId}.${exp}.host.${sig}`
 }
 
 /** Validates an X-Host-Token for a room. Returns the token's userId, or null when invalid/expired. */
 export function requireHostToken(roomId: string, token: string | undefined): string | null {
   if (!token) return null
   const parts = token.split('.')
-  if (parts.length !== 4) return null
-  const [tokRoom, userId, expStr, sig] = parts
-  if (tokRoom !== roomId) return null
+  // Legacy 4-part tokens (pre-kind) were host-only — accept for backwards compat.
+  if (parts.length === 4) {
+    const [tokRoom, userId, expStr, sig] = parts
+    if (tokRoom !== roomId) return null
+    const exp = Number(expStr)
+    if (!Number.isFinite(exp) || exp < Date.now()) return null
+    const expected = createHmac('sha256', SECRET).update(`${tokRoom}.${userId}.${exp}`).digest('base64url')
+    const a = Buffer.from(sig ?? '')
+    const b = Buffer.from(expected)
+    if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+    return userId!
+  }
+  if (parts.length !== 5) return null
+  const [tokRoom, userId, expStr, kind, sig] = parts
+  if (tokRoom !== roomId || kind !== 'host') return null
   const exp = Number(expStr)
   if (!Number.isFinite(exp) || exp < Date.now()) return null
-  const expected = createHmac('sha256', SECRET).update(`${tokRoom}.${userId}.${exp}`).digest('base64url')
+  const expected = createHmac('sha256', SECRET).update(`${tokRoom}.${userId}.${exp}.host`).digest('base64url')
   const a = Buffer.from(sig ?? '')
   const b = Buffer.from(expected)
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null
@@ -85,15 +103,30 @@ export function requireHostToken(roomId: string, token: string | undefined): str
 }
 
 // --- join tokens (same stateless HMAC scheme as host tokens, stored in the
-// t2join cookie) ---
+// t2join cookie). kind='join' — never accepted by requireHostToken. ---
 
 export function issueJoinToken(roomId: string, userId: string): string {
-  return issueHostToken(roomId, userId)
+  const exp = Date.now() + TOKEN_TTL_MS
+  const sig = createHmac('sha256', SECRET).update(`${roomId}.${userId}.${exp}.join`).digest('base64url')
+  return `${roomId}.${userId}.${exp}.join.${sig}`
 }
 
-/** Validates a join token for a room. Returns the token's userId, or null when invalid/expired. */
+/** Validates a join token for a room. Accepts join-kind and host-kind (a host
+ *  may always join); legacy 4-part tokens count as host. Returns userId or null. */
 export function requireJoinToken(roomId: string, token: string | undefined): string | null {
-  return requireHostToken(roomId, token)
+  if (!token) return null
+  const parts = token.split('.')
+  if (parts.length === 4) return requireHostToken(roomId, token)
+  if (parts.length !== 5) return null
+  const [tokRoom, userId, expStr, kind, sig] = parts
+  if (tokRoom !== roomId || (kind !== 'join' && kind !== 'host')) return null
+  const exp = Number(expStr)
+  if (!Number.isFinite(exp) || exp < Date.now()) return null
+  const expected = createHmac('sha256', SECRET).update(`${tokRoom}.${userId}.${exp}.${kind}`).digest('base64url')
+  const a = Buffer.from(sig ?? '')
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+  return userId!
 }
 
 // --- request validation ---
@@ -125,7 +158,11 @@ function parse<T>(schema: z.ZodType<T>, body: unknown, res: { status: (n: number
   return r.data
 }
 
-export function createRoomsRouter(db: Database, userFromReq: UserParser) {
+export function createRoomsRouter(
+  db: Database,
+  userFromReq: UserParser,
+  hooks: { onDeleted?: (roomId: string) => void } = {}
+) {
   const router = Router()
 
   // Prepared once at setup instead of per request. (PUT /api/rooms/:id keeps an
@@ -149,9 +186,13 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
        approved = 0, created_at = excluded.created_at`
   )
   // ponytail: join_requests grows forever otherwise; approved rows older than a
-  // week are pruned lazily on pending reads. Pending rows stay (they're the queue).
+  // week are pruned lazily on pending reads. Stale *pending* rows (>30d, the
+  // requester long gone) go with them — re-requesting is one click.
   const pruneApprovedJoinsStmt = db.prepare(
     `DELETE FROM join_requests WHERE approved = 1 AND created_at < ?`
+  )
+  const pruneStalePendingJoinsStmt = db.prepare(
+    `DELETE FROM join_requests WHERE approved = 0 AND created_at < ?`
   )
   const selectPendingJoinsStmt = db.prepare(
     'SELECT user_id, user_name, user_color, created_at FROM join_requests WHERE room_id = ? AND approved = 0 ORDER BY created_at ASC'
@@ -222,6 +263,55 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
     res.json(toPublicInfo(info))
   })
 
+  // Host-only room delete: drops the per-room sync tables (room_<id>_*), the
+  // room's asset rows + files, its join requests, and the rooms row itself,
+  // then tells the caller (index.ts) to drop the in-memory room + AI session.
+  router.delete('/api/rooms/:id', (req, res) => {
+    const roomId = req.params.id
+    if (!requireHostToken(roomId, req.headers['x-host-token'] as string | undefined)) {
+      res.status(401).json({ error: 'host token required' })
+      return
+    }
+    // Room ids are [a-z0-9]+ (see shared/ids); anything else can neither exist
+    // nor be safely interpolated into the DROP TABLE lookup below.
+    if (!/^[a-z0-9]+$/.test(roomId)) {
+      res.status(404).json({ error: 'room not found' })
+      return
+    }
+    if (!selectRoomByIdStmt.get(roomId)) {
+      res.status(404).json({ error: 'room not found' })
+      return
+    }
+    const prefix = `room_${roomId}_`
+    const tables = (
+      db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ?`).all(`${prefix}%`) as {
+        name: string
+      }[]
+    ).filter((t) => t.name.startsWith(prefix))
+    for (const t of tables) {
+      db.exec(`DROP TABLE IF EXISTS "${t.name.replace(/"/g, '""')}"`)
+    }
+    // Asset files are best-effort (a missing file must not fail the delete);
+    // the DB rows go in one transaction with the room + join-request rows.
+    const assetRows = db.prepare('SELECT path FROM assets WHERE room_id = ?').all(roomId) as { path: string }[]
+    for (const r of assetRows) {
+      try {
+        const abs = path.resolve(DATA_DIR, r.path)
+        if (abs.startsWith(path.resolve(DATA_DIR) + path.sep)) rmSync(abs, { force: true })
+      } catch {
+        // best-effort
+      }
+    }
+    db.transaction(() => {
+      db.prepare('DELETE FROM assets WHERE room_id = ?').run(roomId)
+      db.prepare('DELETE FROM join_requests WHERE room_id = ?').run(roomId)
+      db.prepare('DELETE FROM rooms WHERE id = ?').run(roomId)
+    })()
+    log.info(`room ${roomId} deleted (${tables.length} sync table(s), ${assetRows.length} asset(s))`)
+    hooks.onDeleted?.(roomId)
+    res.json({ ok: true })
+  })
+
   router.post('/api/rooms/:id/join', (req, res) => {
     const body = parse(joinBody, req.body, res)
     if (!body) return
@@ -282,6 +372,7 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
     }
     // lazy prune of week-old approved rows (see pruneApprovedJoinsStmt)
     pruneApprovedJoinsStmt.run(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    pruneStalePendingJoinsStmt.run(Date.now() - 30 * 24 * 60 * 60 * 1000)
     const rows = selectPendingJoinsStmt.all(req.params.id) as {
       user_id: string
       user_name: string
@@ -298,7 +389,18 @@ export function createRoomsRouter(db: Database, userFromReq: UserParser) {
     }
     const body = parse(approveBody, req.body, res)
     if (!body) return
-    approveJoinStmt.run(req.params.id, body.userId)
+    // Approving into a deleted room must not silently succeed.
+    if (!selectRoomByIdStmt.get(req.params.id)) {
+      res.status(404).json({ error: 'room not found' })
+      return
+    }
+    // Approving a user who never requested access is a typo'd userId, not a
+    // success — the guest would wait on 'pending' forever otherwise.
+    const info = approveJoinStmt.run(req.params.id, body.userId)
+    if (info.changes === 0) {
+      res.status(404).json({ error: 'unknown join request' })
+      return
+    }
     res.json({ ok: true })
   })
 

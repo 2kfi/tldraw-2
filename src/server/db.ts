@@ -1,8 +1,7 @@
 import Database from 'better-sqlite3'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
-
-export const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), 'data')
+import { DATA_DIR } from './config'
 
 export function getDb(): Database.Database {
   mkdirSync(DATA_DIR, { recursive: true })
@@ -46,6 +45,15 @@ export function getDb(): Database.Database {
       duration REAL NOT NULL DEFAULT 0,
       art_path TEXT,
       mtime REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS music_proposals (
+      id TEXT PRIMARY KEY,
+      file TEXT NOT NULL,
+      orig_name TEXT NOT NULL,
+      submitted_by TEXT NOT NULL DEFAULT '',
+      submitted_by_name TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL
     );
   `)
   // Migration for DBs created before the access-control columns existed:

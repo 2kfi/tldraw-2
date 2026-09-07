@@ -3,13 +3,23 @@ import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'nod
 import path from 'node:path'
 import { parseFile } from 'music-metadata'
 import type { Database } from 'better-sqlite3'
-import { DATA_DIR } from '../db'
+import { DATA_DIR, MUSIC_DIR } from '../config'
 
 // Docker compose binds ./music → /data/music; local dev defaults to ./data/music.
-export const MUSIC_DIR = process.env.MUSIC_DIR ?? path.join(DATA_DIR, 'music')
+// MUSIC_DIR is resolved once in config.ts; this re-export keeps the existing
+// `import { MUSIC_DIR } from './music/scanner'` path working.
+export { MUSIC_DIR }
 const ART_DIR = path.join(DATA_DIR, 'cache', 'art')
 const EXTS = new Set(['.mp3', '.m4a', '.flac', '.ogg', '.opus', '.wav', '.aac'])
 const COVER_NAMES = ['cover.jpg', 'folder.jpg', 'cover.png']
+
+// Wall-clock time the last scan finished. GET /api/music reports this as
+// `scannedAt` (the actual scan time, not the request time); /ready uses it
+// for the scan age.
+let completedAt: number | null = null
+export function lastScanAt(): number | null {
+  return completedAt
+}
 
 export type ScannedTrack = {
   id: string
@@ -112,5 +122,6 @@ export async function scanMusicDir(db: Database): Promise<{ tracks: ScannedTrack
       removed++
     }
   }
+  completedAt = Date.now()
   return { tracks, added, removed }
 }

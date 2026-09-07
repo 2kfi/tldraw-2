@@ -4,7 +4,7 @@ import path from 'node:path'
 import { Router } from 'express'
 import multer from 'multer'
 import type { Database } from 'better-sqlite3'
-import { DATA_DIR } from './db'
+import { DATA_DIR } from './config'
 
 const MAX_BYTES = 50 * 1024 * 1024
 const ALLOWED = /^(image|video|audio)\//

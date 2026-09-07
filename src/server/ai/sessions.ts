@@ -14,15 +14,16 @@ import {
 	tipTapDefaultExtensions,
 } from 'tldraw'
 import type { BoxModel, TLShape, TLShapeId } from 'tldraw'
-import { AI_STATE_ID, createDefaultAiState, schema } from '../../shared/schema'
-import type { AiState } from '../../shared/schema'
+import { AI_STATE_ID, MAX_AI_QUEUE_LENGTH, MAX_SCREENSHOT_CHARS, createDefaultAiState, schema } from '../../shared/schema'
+import type { AiQueuedPrompt, AiState } from '../../shared/schema'
 import type { UnknownRecord } from '@tldraw/store'
 import type { SessionMeta } from '../sync'
 import type { UserInfo } from '../../shared/types'
 import { createSessionId } from '../../shared/ids'
-import { DEFAULT_MODEL_NAME, isValidModelName } from '../../shared/agent/models'
+import { getCheapFallbackModel, isValidModelName, resolveDefaultModelName } from '../../shared/agent/models'
 import type { AgentModelName } from '../../shared/agent/models'
 import { convertTldrawShapeToBlurryShape } from '../../shared/agent/format/convertTldrawShapeToBlurryShape'
+import { convertTldrawShapesToPeripheralShapes } from '../../shared/agent/format/convertTldrawShapesToPeripheralShapes'
 import {
 	convertTldrawIdToSimpleId,
 	convertTldrawShapeToFocusedShape,
@@ -49,6 +50,11 @@ const MAX_CONVERSATION = 50
 const POLL_MS = 250
 // ponytail: cap blurry shapes in the prompt so huge boards stay cheap
 const MAX_BLURRY_SHAPES = 40
+const MAX_PERIPHERAL_CLUSTERS = 10
+
+function getQueue(s: AiState): AiQueuedPrompt[] {
+	return Array.isArray((s as any).queue) ? ((s as any).queue as AiQueuedPrompt[]) : []
+}
 
 function sleep(ms: number) {
 	return new Promise((r) => setTimeout(r, ms))
@@ -282,6 +288,10 @@ export class AiSession {
 				promptModel: null,
 				promptSelection: null,
 				promptViewport: null,
+				promptIncludeScreenshot: false,
+				promptScreenshot: null,
+				// ponytail: keep the queue — Stop halts the in-flight run, queued
+				// prompts still run next tick (Clear is what empties the queue).
 			})
 		}
 	}
@@ -352,8 +362,34 @@ export class AiSession {
 			await this.ensureMounted()
 			while (!this.stop) {
 				const aiState = this.getAiState()
-				if (aiState?.status === 'pending') {
-					await this.runPrompt(aiState)
+				if (!aiState) {
+					await sleep(POLL_MS)
+					continue
+				}
+				const queue = getQueue(aiState)
+				const hasLegacyPending = aiState.status === 'pending' && !!aiState.prompt
+				if (!this.running && (queue.length > 0 || hasLegacyPending)) {
+					if (queue.length > 0) {
+						const [next, ...rest] = queue
+						const start: AiState = {
+							...aiState,
+							status: 'pending',
+							prompt: next!.prompt,
+							promptModel: next!.promptModel,
+							promptSelection: next!.promptSelection,
+							promptViewport: next!.promptViewport,
+							promptIncludeScreenshot: next!.includeScreenshot ?? false,
+							promptScreenshot: next!.screenshot ?? null,
+							queue: rest.slice(0, MAX_AI_QUEUE_LENGTH),
+							lockedBy: next!.by ?? aiState.lockedBy,
+							lockedByName: next!.byName ?? aiState.lockedByName,
+						}
+						// Dequeue synchronously before the run so mid-run submits append to `rest`.
+						this.putAiState({ ...start, status: 'running', streamingText: '', error: null })
+						await this.runPrompt(start)
+					} else {
+						await this.runPrompt(aiState)
+					}
 				} else if (aiState?.status === 'running' && !this.running) {
 					// stale lock left behind by a crashed run
 					this.putAiState(resetStaleAiState(aiState))
@@ -368,13 +404,8 @@ export class AiSession {
 
 	private resolveModel(promptModel: string | null): AgentModelName {
 		if (promptModel && isValidModelName(promptModel)) return promptModel
-		const envDefault = process.env.OPENAI_DEFAULT_MODEL
-		if (envDefault && isValidModelName(envDefault)) return envDefault
-		// Fall back to a model for a provider the operator actually configured,
-		// so an OpenAI-only (or Google-only) setup works without an env default.
-		if (process.env.GOOGLE_API_KEY) return 'gemini-3.5-flash'
-		if (process.env.OPENAI_API_KEY) return 'gpt-5.4-mini'
-		return DEFAULT_MODEL_NAME
+		// Single shared default: Google-first, else a valid OPENAI_DEFAULT_MODEL, else mini.
+		return resolveDefaultModelName(process.env as Record<string, string | undefined>)
 	}
 
 	private buildPrompt(aiState: AiState, modelName: AgentModelName): AgentPrompt {
@@ -393,10 +424,11 @@ export class AiSession {
 
 		const viewport = aiState.promptViewport as BoxModel | null
 		let blurryShapes: BlurryShape[] = []
+		let peripheralClusters: { bounds: BoxModel; numberOfShapes: number }[] = []
 		if (viewport) {
 			const bounds = new Box(viewport.x, viewport.y, viewport.w, viewport.h)
-			const inView = editor
-				.getCurrentPageShapes()
+			const pageShapes = editor.getCurrentPageShapes()
+			const inView = pageShapes
 				.filter((s: TLShape) => {
 					const b = editor.getShapeMaskedPageBounds(s)
 					return b && b.collides(bounds)
@@ -405,7 +437,38 @@ export class AiSession {
 			blurryShapes = inView
 				.map((s) => convertTldrawShapeToBlurryShape(editor, s))
 				.filter((b): b is BlurryShape => b !== null)
+			// Peripheral vision is cheap: same bounds pass, clustered off-screen shapes.
+			try {
+				const outView = pageShapes.filter((s: TLShape) => {
+					try {
+						const b = editor.getShapeMaskedPageBounds(s)
+						return b && !b.collides(bounds)
+					} catch {
+						return false
+					}
+				})
+				if (outView.length > 0) {
+					peripheralClusters = convertTldrawShapesToPeripheralShapes(editor, outView, {
+						padding: 200,
+					}).slice(0, MAX_PERIPHERAL_CLUSTERS) as { bounds: BoxModel; numberOfShapes: number }[]
+				}
+			} catch {
+				// ponytail: peripheral context is best-effort; blurry shapes carry the run
+			}
+			// ponytail: canvasLints deliberately not wired — no headless lint engine
+			// exists server-side, and synthesizing overlap/arrow heuristics here risks
+			// the spike-f sanitize/apply path. Structured shapes + screenshot suffice.
 		}
+
+		// Optional per-prompt screenshot (client-captured, size-gated). Empty string
+		// keeps the structured-data path identical when the toggle is off.
+		const rawScreenshot = (aiState as AiState).promptScreenshot ?? null
+		const screenshot =
+			typeof rawScreenshot === 'string' &&
+			rawScreenshot.startsWith('data:image/') &&
+			rawScreenshot.length <= MAX_SCREENSHOT_CHARS
+				? rawScreenshot
+				: ''
 
 		const history: ChatHistoryItem[] = aiState.conversation.map((m) => ({
 			type: 'prompt',
@@ -424,6 +487,8 @@ export class AiSession {
 			'selectedShapes',
 			'userViewportBounds',
 			'blurryShapes',
+			'peripheralShapes',
+			'screenshot',
 			'time',
 			'modelName',
 		]
@@ -440,6 +505,8 @@ export class AiSession {
 			selectedShapes: { type: 'selectedShapes', shapeIds: selectedShapes },
 			userViewportBounds: { type: 'userViewportBounds', userBounds: viewport },
 			blurryShapes: { type: 'blurryShapes', shapes: blurryShapes },
+			peripheralShapes: { type: 'peripheralShapes', clusters: peripheralClusters },
+			screenshot: { type: 'screenshot', screenshot },
 			time: { type: 'time', time: new Date().toISOString() },
 			modelName: { type: 'modelName', modelName },
 			// ponytail: the kit's AgentPrompt type requires every part; buildMessages
@@ -482,50 +549,88 @@ export class AiSession {
 			if (this.stopRequested) return
 			this.stopRequested = false
 		this.putAiState({ ...start, status: 'running', streamingText: '', error: null })
-		const prompt = this.buildPrompt(start, this.resolveModel(start.promptModel))
-		const events = withTimeout(this.service.stream(prompt), RUN_TIMEOUT_MS, this.runAbort.signal)
+		const primaryModel = this.resolveModel(start.promptModel)
+		// Retry-once on the cheap fallback instead of a dead error: a 400/429/5xx
+		// on the picked model gets one more shot on flash-lite/mini.
+		const fallback = getCheapFallbackModel(
+			primaryModel,
+			process.env as Record<string, string | undefined>
+		)
+		const attempts: AgentModelName[] = fallback && fallback !== primaryModel ? [primaryModel, fallback] : [primaryModel]
 		let lastThought = ''
-		for await (const event of events) {
-			if (event._type === 'message') {
-				assistantText = (event as any).text ?? ''
-				this.scheduleStreamingText(assistantText)
-				continue
-			}
-			if (event._type === 'think') {
-				// Surface reasoning live in the streaming bubble until the actual
-				// reply (message action) replaces it. Models emit think either as
-				// progressive partials or one complete chunk — show both.
-				const thought = (event as any).text
-				if (!assistantText) {
-					if (typeof thought === 'string' && thought) {
-						lastThought = thought
-						this.scheduleStreamingText(thought)
+		let appliedCount = 0
+		let appliedKinds: string[] = []
+		for (let attempt = 0; attempt < attempts.length; attempt++) {
+			const modelName = attempts[attempt]!
+			const prompt = this.buildPrompt(start, modelName)
+			try {
+				const events = withTimeout(this.service.stream(prompt), RUN_TIMEOUT_MS, this.runAbort.signal)
+				for await (const event of events) {
+					if (event._type === 'message') {
+						assistantText = (event as any).text ?? ''
+						this.scheduleStreamingText(assistantText)
+						continue
 					}
+					if (event._type === 'think') {
+						// Surface reasoning live in the streaming bubble until the actual
+						// reply (message action) replaces it. Models emit think either as
+						// progressive partials or one complete chunk — show both.
+						const thought = (event as any).text
+						if (!assistantText) {
+							if (typeof thought === 'string' && thought) {
+								lastThought = thought
+								this.scheduleStreamingText(thought)
+							}
+						}
+					}
+					if (!event.complete) continue
+					const util = this.utils?.[event._type]
+					if (!util) {
+						log.warn(`[ai] room ${this.roomId}: no handler for action type "${event._type}"`)
+						continue
+					}
+					log.debug(`[ai] room ${this.roomId}: applying "${event._type}":`, JSON.stringify(event).slice(0, 400))
+						try {
+							const sanitized = util.sanitizeAction(event, this.helpers!)
+							if (sanitized) {
+								await util.applyAction(sanitized, this.helpers!, this.runAbort.signal)
+								appliedCount++
+								if (!appliedKinds.includes(event._type)) appliedKinds.push(event._type)
+							}
+						} catch (error) {
+							log.error(`[ai] room ${this.roomId} failed to apply ${event._type}`, error)
+						}
+					}
+				break
+			} catch (error) {
+				const isLast = attempt === attempts.length - 1
+				if (!isLast && !this.runAbort?.signal.aborted) {
+					log.warn(`[ai] room ${this.roomId}: ${modelName} failed, retrying once on ${attempts[attempt + 1]}`, error)
+					continue
 				}
+				throw error
 			}
-			if (!event.complete) continue
-			const util = this.utils?.[event._type]
-			if (!util) {
-				log.warn(`[ai] room ${this.roomId}: no handler for action type "${event._type}"`)
-				continue
-			}
-			log.debug(`[ai] room ${this.roomId}: applying "${event._type}":`, JSON.stringify(event).slice(0, 400))
-				try {
-					const sanitized = util.sanitizeAction(event, this.helpers!)
-					if (sanitized) await util.applyAction(sanitized, this.helpers!, this.runAbort.signal)
-				} catch (error) {
-					log.error(`[ai] room ${this.roomId} failed to apply ${event._type}`, error)
-				}
-			}
+		}
 			this.flushStreamingText()
-			const finalText = assistantText.trim() || 'Done.'
+			// Prefer streamed message deltas over a canned fallback: message text,
+			// else the live thought that was already shown, else a summary of what
+			// actually changed on the canvas.
+			const finalText =
+				assistantText.trim() ||
+				this.pendingStreamingText.trim() ||
+				lastThought.trim() ||
+				(appliedCount > 0
+					? `Made ${appliedCount} change${appliedCount === 1 ? '' : 's'} (${appliedKinds.join(', ')}).`
+					: 'No changes were needed.')
 			const cur = this.getAiState()!
-			if (cur.status === 'pending') {
+			const stillQueued = getQueue(cur).length > 0 || (cur.status === 'pending' && !!cur.prompt)
+			if (stillQueued || cur.status === 'pending') {
 				// A new prompt queued mid-run: keep it pending and just append this
 				// reply. The loop picks the queued prompt up next and runs it fresh,
 				// so both prompts end up answered in order.
 				this.putAiState({
 					...cur,
+					status: 'pending',
 					conversation: [...cur.conversation, { role: 'assistant' as const, content: finalText }].slice(-MAX_CONVERSATION),
 				})
 			} else {
@@ -541,6 +646,8 @@ export class AiSession {
 					promptModel: null,
 					promptSelection: null,
 					promptViewport: null,
+					promptIncludeScreenshot: false,
+					promptScreenshot: null,
 				})
 			}
 		} catch (error) {
@@ -591,6 +698,11 @@ export class SessionManager {
 			session.destroy()
 			this.sessions.delete(roomId)
 		}
+	}
+
+	/** Live AI session count (for /ready). */
+	get size(): number {
+		return this.sessions.size
 	}
 
 	/** Idempotent user-facing cancel: no-ops if the room has no live session. */

@@ -4,6 +4,42 @@ import { T } from '@tldraw/validate'
 
 export const AI_STATE_ID = 'aiState:global' as const
 export const MUSIC_STATE_ID = 'musicState:global' as const
+// ponytail: queue cap + screenshot gate live here so client and server agree.
+export const MAX_AI_QUEUE_LENGTH = 10
+export const MAX_SCREENSHOT_CHARS = 400_000
+
+export type AiQueuedPrompt = {
+	id: string
+	prompt: string
+	promptModel: string | null
+	promptSelection: string[] | null
+	promptViewport: { x: number; y: number; w: number; h: number } | null
+	includeScreenshot?: boolean
+	screenshot?: string
+	by?: string
+	byName?: string
+	byColor?: string
+	queuedAt?: number
+}
+
+const aiQueuedPromptValidator = T.object({
+	id: T.string,
+	prompt: T.string,
+	promptModel: T.string.nullable(),
+	promptSelection: T.arrayOf(T.string).nullable(),
+	promptViewport: T.object({
+		x: T.number,
+		y: T.number,
+		w: T.number,
+		h: T.number,
+	}).nullable(),
+	includeScreenshot: T.boolean.nullable().optional(),
+	screenshot: T.string.nullable().optional(),
+	by: T.string.optional(),
+	byName: T.string.optional(),
+	byColor: T.string.optional(),
+	queuedAt: T.number.optional(),
+})
 
 export const aiStateValidator = T.object({
   id: idValidator('aiState'),
@@ -31,6 +67,12 @@ export const aiStateValidator = T.object({
     w: T.number,
     h: T.number,
   }).nullable(),
+  // Optional screenshot for the running prompt (data URL, size-gated client-side).
+  promptIncludeScreenshot: T.boolean.nullable().optional(),
+  promptScreenshot: T.string.nullable().optional(),
+  // Append-only queue: sequential submits from one client all survive (cap 10).
+  // Optional so rooms persisted before Phase 3 still validate.
+  queue: T.arrayOf(aiQueuedPromptValidator).optional(),
 })
 
 export const musicStateValidator = T.object({
@@ -68,6 +110,9 @@ export type AiState = {
   promptModel: string | null
   promptSelection: string[] | null
   promptViewport: { x: number; y: number; w: number; h: number } | null
+  promptIncludeScreenshot?: boolean | null
+  promptScreenshot?: string | null
+  queue?: AiQueuedPrompt[]
 }
 
 export type MusicState = {
@@ -96,6 +141,9 @@ export function createDefaultAiState(): AiState {
     promptModel: null,
     promptSelection: null,
     promptViewport: null,
+    promptIncludeScreenshot: false,
+    promptScreenshot: null,
+    queue: [],
   }
 }
 

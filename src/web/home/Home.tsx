@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { setUser, useUser } from '../lib/user'
 import { allHostKeys, getHostToken, setHostKey, setHostToken } from '../lib/host'
 import { api } from '../lib/api'
+import { useFocusTrap } from '../lib/useFocusTrap'
 
 type MyBoard = { roomId: string; name: string; updatedAt: number }
 
@@ -15,6 +16,18 @@ export function Home() {
   const [createPassword, setCreatePassword] = useState('')
   const [requireApproval, setRequireApproval] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
+
+  // Inline dialogs (share-modal pattern) replacing prompt().
+  const [renameTarget, setRenameTarget] = useState<MyBoard | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [nameDialogOpen, setNameDialogOpen] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const user = useUser()
+  useFocusTrap(dialogRef, renameTarget !== null || nameDialogOpen, () => {
+    setRenameTarget(null)
+    setNameDialogOpen(false)
+  })
 
   async function refreshBoards() {
     const keys = Object.values(allHostKeys())
@@ -69,17 +82,37 @@ export function Home() {
     window.location.hash = `/r/${id}`
   }
 
-  async function rename(board: MyBoard) {
-    const token = getHostToken(board.roomId)
-    if (!token) return
-    const name = prompt('Board name', board.name)
+  function openRename(board: MyBoard) {
+    setRenameDraft(board.name)
+    setRenameTarget(board)
+  }
+
+  async function submitRename(e: React.FormEvent) {
+    e.preventDefault()
+    if (!renameTarget) return
+    const token = getHostToken(renameTarget.roomId)
+    if (!token) {
+      setRenameTarget(null)
+      return
+    }
+    const name = renameDraft.trim()
     if (!name) return
-    await api(`/api/rooms/${board.roomId}`, {
+    await api(`/api/rooms/${renameTarget.roomId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', 'X-Host-Token': token },
       body: JSON.stringify({ name }),
     })
+    setRenameTarget(null)
     refreshBoards()
+  }
+
+  function submitName(e: React.FormEvent) {
+    e.preventDefault()
+    const name = nameDraft.trim()
+    if (name) {
+      setUser({ name })
+      window.location.reload()
+    }
   }
 
   // Clipboard API needs a secure context; fall back to execCommand on HTTP.
@@ -101,13 +134,22 @@ export function Home() {
     window.setTimeout(() => setCopiedId(null), 1500)
   }
 
-  const user = useUser()
+  const dialogOpen = renameTarget !== null || nameDialogOpen
 
   return (
-    <div className="home">
-      <h1 className="home-title">tldraw-2</h1>
-      <p className="home-subtitle">A shared, self-hosted whiteboard.</p>
-      <div className="home-actions">
+    <main id="main-content" className="home" tabIndex={-1}>
+      <header className="home-hero">
+        <span className="home-sticker" aria-hidden="true">live · together</span>
+        <p className="home-eyebrow">Shared whiteboard for small crews</p>
+        <h1 className="home-wordmark">Sketchparty</h1>
+        <p className="home-thesis">Draw together, score it, ask the board.</p>
+        <p className="home-sub">
+          One link opens a shared canvas with a live soundtrack and an AI that can
+          actually draw. Create a room, send the link — that&apos;s the whole setup.
+        </p>
+      </header>
+      <p className="home-section-label" id="home-start-label">Start a board</p>
+      <div className="home-actions" role="group" aria-labelledby="home-start-label">
         <form className="home-create" onSubmit={(e) => { e.preventDefault(); createRoom() }}>
           <input
             className="home-input"
@@ -115,6 +157,7 @@ export function Home() {
             value={createPassword}
             onChange={(e) => setCreatePassword(e.target.value)}
             placeholder="Optional password"
+            aria-label="Optional password for the new room"
           />
           <label className="home-check">
             <input type="checkbox" checked={requireApproval} onChange={(e) => setRequireApproval(e.target.checked)} />
@@ -130,18 +173,21 @@ export function Home() {
             value={joinId}
             onChange={(e) => setJoinId(e.target.value)}
             placeholder="Or paste a room id"
+            aria-label="Room id or link to join"
           />
           <button className="home-link" type="submit">
             Join
           </button>
         </form>
       </div>
-      <section className="boards">
-        <h2 className="boards-title">Your boards</h2>
+      <section className="boards" aria-labelledby="boards-title">
+        <h2 className="boards-title" id="boards-title">Your boards</h2>
         {boards === null ? (
           <p className="home-muted">Loading…</p>
         ) : boards.length === 0 ? (
-          <p className="home-muted">No boards yet — create a room to get a host key.</p>
+          <p className="home-empty">
+            No boards yet. Create your first room above — its link and host key land here.
+          </p>
         ) : (
           <ul className="boards-list">
             {boards.map((b) => (
@@ -154,7 +200,7 @@ export function Home() {
                 </div>
                 <div className="board-actions">
                   {getHostToken(b.roomId) && (
-                    <button className="board-btn" onClick={() => rename(b)}>
+                    <button className="board-btn" onClick={() => openRename(b)}>
                       Rename
                     </button>
                   )}
@@ -177,16 +223,80 @@ export function Home() {
           href="#"
           onClick={(e) => {
             e.preventDefault()
-            const name = prompt('Display name', user.name)
-            if (name) {
-              setUser({ name })
-              window.location.reload()
-            }
+            setNameDraft(user.name)
+            setNameDialogOpen(true)
           }}
         >
           Change name
         </a>
       </p>
-    </div>
+      {dialogOpen && (
+        <div
+          className="room-modal-backdrop"
+          onClick={() => {
+            setRenameTarget(null)
+            setNameDialogOpen(false)
+          }}
+        >
+          <div
+            className="room-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={renameTarget ? 'Rename board' : 'Change display name'}
+            tabIndex={-1}
+            ref={dialogRef}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {renameTarget ? (
+              <form className="home-dialog-form" onSubmit={submitRename}>
+                <div className="room-modal-header">
+                  <span className="room-modal-title">Rename board</span>
+                </div>
+                <input
+                  className="room-input"
+                  value={renameDraft}
+                  maxLength={60}
+                  autoFocus
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  placeholder="Board name"
+                  aria-label="Board name"
+                />
+                <div className="room-share-pw">
+                  <button className="room-btn" type="submit" disabled={!renameDraft.trim()}>
+                    Save
+                  </button>
+                  <button className="room-btn" type="button" onClick={() => setRenameTarget(null)}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form className="home-dialog-form" onSubmit={submitName}>
+                <div className="room-modal-header">
+                  <span className="room-modal-title">Change display name</span>
+                </div>
+                <input
+                  className="room-input"
+                  value={nameDraft}
+                  maxLength={24}
+                  autoFocus
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  placeholder="Display name"
+                  aria-label="Display name"
+                />
+                <div className="room-share-pw">
+                  <button className="room-btn" type="submit" disabled={!nameDraft.trim()}>
+                    Save
+                  </button>
+                  <button className="room-btn" type="button" onClick={() => setNameDialogOpen(false)}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+    </main>
   )
 }

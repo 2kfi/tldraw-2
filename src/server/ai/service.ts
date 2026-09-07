@@ -97,6 +97,30 @@ export class AgentService {
 		const models: { provider: AgentModelProvider; id: string; chat: boolean }[] = []
 		let liveFailed = false
 		const authFailed: AgentModelProvider[] = []
+		// Google-first: cheapest good default, then OpenAI-compatible, then Anthropic.
+		if (this.configured.google) {
+			try {
+				const res = await fetch(
+					`https://generativelanguage.googleapis.com/v1beta/models?key=${this.googleApiKey}`,
+					{ signal: AbortSignal.timeout(3000) }
+				)
+				if (res.ok) {
+					const body = (await res.json()) as { models?: { name?: string }[] }
+					for (const m of body.models ?? []) {
+						const id = m.name?.replace(/^models\//, '')
+						if (!id) continue
+						const chat = isChatModel('google', id)
+						if (chat) registerLiveModel(id, 'google')
+						models.push({ provider: 'google', id, chat })
+					}
+				} else {
+					liveFailed = true
+					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('google')
+				}
+			} catch {
+				liveFailed = true
+			}
+		}
 		if (this.configured.openai) {
 			try {
 				const base = (this.openaiBaseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
@@ -116,29 +140,6 @@ export class AgentService {
 				} else {
 					liveFailed = true
 					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('openai')
-				}
-			} catch {
-				liveFailed = true
-			}
-		}
-		if (this.configured.google) {
-			try {
-				const res = await fetch(
-					`https://generativelanguage.googleapis.com/v1beta/models?key=${this.googleApiKey}`,
-					{ signal: AbortSignal.timeout(3000) }
-				)
-				if (res.ok) {
-					const body = (await res.json()) as { models?: { name?: string }[] }
-					for (const m of body.models ?? []) {
-						const id = m.name?.replace(/^models\//, '')
-						if (!id) continue
-						const chat = isChatModel('google', id)
-						if (chat) registerLiveModel(id, 'google')
-						models.push({ provider: 'google', id, chat })
-					}
-				} else {
-					liveFailed = true
-					if (isAuthRejection(res.status, await res.text().catch(() => ''))) authFailed.push('google')
 				}
 			} catch {
 				liveFailed = true
@@ -251,7 +252,7 @@ export class AgentService {
 				system,
 				messages,
 				allowSystemInMessages: usesSystemMessage,
-				maxOutputTokens: 8192,
+				maxOutputTokens: modelDefinition.maxOutputTokens ?? 8192,
 				// Opus 4.7+ removed `temperature` (and top_p/top_k); sending it returns a 400.
 				...(modelDefinition.supportsTemperature ? { temperature: 0 } : {}),
 				providerOptions: getProviderOptions(modelDefinition),
@@ -294,6 +295,16 @@ export class AgentService {
 				while (actions.length > cursor) {
 					const action = actions[cursor] as AgentAction
 					if (action) {
+						// ponytail: temporary diagnostics — creates arriving without a
+						// shape silently no-op in applyAction; capture the raw tail.
+						if (
+							(action as any)._type === 'create' &&
+							!(action as any).shape
+						) {
+							log.warn(
+								`streamActions: create without shape; raw tail: ${JSON.stringify(buffer.slice(-600))}`
+							)
+						}
 						events.push({
 							...action,
 							complete: true,
@@ -359,6 +370,13 @@ export class AgentService {
 			if (cursor === 0) {
 				log.warn(
 					`streamActions: 0 actions parsed (finish=${await result.finishReason}) model=${modelId}`
+				)
+			}
+			// A token-capped stream truncates mid-JSON; closeAndParseJson auto-closes
+			// it and trailing fields (e.g. a create's shape) are silently lost.
+			if ((await result.finishReason) === 'length') {
+				log.warn(
+					`streamActions: output truncated at token limit (${modelDefinition.maxOutputTokens ?? 8192}) — raise maxOutputTokens for ${modelId}`
 				)
 			}
 		} catch (error: any) {

@@ -1,6 +1,6 @@
 {
   "name": "tldraw-2",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +10,9 @@
     "dev": "node scripts/dev.mjs",
     "build": "tsup && vite build",
     "start": "node --env-file-if-exists=.env dist/server/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/spike-b.mjs && npm run test:spike-c && node scripts/spike-d.mjs && node scripts/spike-e.mjs && node scripts/spike-f.mjs && node scripts/spike-g.mjs && node scripts/spike-h.mjs",
+    "test:spike-c": "sh -c 'rm -rf /tmp/opencode/spikec-data && PORT=3051 DATA_DIR=/tmp/opencode/spikec-data node dist/server/index.js & SRV=$!; trap \"kill $SRV; rm -rf /tmp/opencode/spikec-data\" EXIT; for i in $(seq 1 120); do curl -sf http://127.0.0.1:3051/api/health >/dev/null && break; sleep 0.25; done; node scripts/spike-c.mjs'"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^2.0.94",

@@ -30,6 +30,13 @@ interface BaseAgentModelDefinition {
 	 * Opus 4.7+ removed `temperature`/`top_p`/`top_k` (sending them is a 400).
 	 */
 	supportsTemperature: boolean
+
+	/**
+	 * Output token budget for agent runs. Verbose thinking models burn budget
+	 * inside `think` actions and can truncate mid-JSON (shape lost). Must not
+	 * exceed the model's own output cap — the provider 400s otherwise.
+	 */
+	maxOutputTokens?: number
 }
 
 export interface AnthropicModelDefinition extends BaseAgentModelDefinition {
@@ -99,6 +106,7 @@ export const AGENT_MODEL_DEFINITIONS = {
 		supportsPrefill: true,
 		supportsTemperature: true,
 		thinkingLevel: 'minimal',
+		maxOutputTokens: 32768,
 	},
 
 	'gemini-3.1-pro-preview': {
@@ -108,6 +116,7 @@ export const AGENT_MODEL_DEFINITIONS = {
 		supportsPrefill: true,
 		supportsTemperature: true,
 		thinkingLevel: 'low', // minimal is not supported on 3.1 pro, so low is the floor
+		maxOutputTokens: 32768,
 	},
 
 	'gemini-3.1-flash-lite': {
@@ -117,6 +126,7 @@ export const AGENT_MODEL_DEFINITIONS = {
 		supportsPrefill: true,
 		supportsTemperature: true,
 		thinkingLevel: 'minimal',
+		maxOutputTokens: 32768,
 	},
 
 	// OpenAI models
@@ -178,7 +188,48 @@ export function registerLiveModel(id: string, provider: AgentModelProvider): voi
 	}
 }
 
-export const DEFAULT_MODEL_NAME: AgentModelName = 'claude-sonnet-4-6'
+export const DEFAULT_MODEL_NAME: AgentModelName = 'gpt-5.4-mini'
+
+// Google-first ordering: Google -> custom OpenAI-compatible -> Anthropic.
+export const PROVIDER_ORDER: AgentModelProvider[] = ['google', 'openai', 'anthropic']
+export const GOOGLE_DEFAULT_MODEL: AgentModelName = 'gemini-3.5-flash'
+export const OPENAI_FALLBACK_MODEL: AgentModelName = 'gpt-5.4-mini'
+export const ANTHROPIC_FALLBACK_MODEL: AgentModelName = 'claude-haiku-4-5'
+
+export function compareProviderOrder(a: AgentModelProvider, b: AgentModelProvider): number {
+	return PROVIDER_ORDER.indexOf(a) - PROVIDER_ORDER.indexOf(b)
+}
+
+/**
+ * Single shared default: Gemini Flash when a Google key is set (cheapest good
+ * default), else a valid OPENAI_DEFAULT_MODEL, else the OpenAI/Anthropic
+ * fallback. Both the session and the models endpoints use this so the client
+ * picker and the server runner never disagree.
+ */
+export function resolveDefaultModelName(env: Record<string, string | undefined> = {}): AgentModelName {
+	const e = env.GOOGLE_API_KEY !== undefined ? env : (typeof process !== 'undefined' ? (process as any).env ?? {} : {})
+	if (e.GOOGLE_API_KEY) return GOOGLE_DEFAULT_MODEL
+	if (e.OPENAI_DEFAULT_MODEL && isValidModelName(e.OPENAI_DEFAULT_MODEL)) return e.OPENAI_DEFAULT_MODEL
+	if (e.OPENAI_API_KEY) return OPENAI_FALLBACK_MODEL
+	if (e.ANTHROPIC_API_KEY) return ANTHROPIC_FALLBACK_MODEL
+	return OPENAI_FALLBACK_MODEL
+}
+
+/**
+ * Cheap retry target for retry-once-on-fallback: prefer Flash-Lite on Google,
+ * else the OpenAI mini, else Haiku. Returns null when nothing else is
+ * configured (the original error stands).
+ */
+export function getCheapFallbackModel(
+	primary: string,
+	env: Record<string, string | undefined> = {}
+): AgentModelName | null {
+	const e = env.GOOGLE_API_KEY !== undefined ? env : (typeof process !== 'undefined' ? (process as any).env ?? {} : {})
+	if (e.GOOGLE_API_KEY && primary !== 'gemini-3.1-flash-lite') return 'gemini-3.1-flash-lite'
+	if ((e.OPENAI_API_KEY || e.OPENAI_BASE_URL) && primary !== 'gpt-5.4-mini') return 'gpt-5.4-mini'
+	if (e.ANTHROPIC_API_KEY && primary !== 'claude-haiku-4-5') return 'claude-haiku-4-5'
+	return null
+}
 
 /**
  * Check if a string is a valid AgentModelName.

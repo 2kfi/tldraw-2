@@ -5,6 +5,7 @@ import { schema } from '../shared/schema'
 import type { Database } from 'better-sqlite3'
 import type { UserInfo } from '../shared/types'
 import { createSessionId } from '../shared/ids'
+import { log } from './log'
 
 export type SessionMeta = { user: UserInfo }
 
@@ -83,5 +84,37 @@ export class RoomManager {
         }
       }, 60_000)
     }
+  }
+
+  /** In-memory room without materializing it (music op authz reads). Never
+   * creates a room or AI session — returns undefined when not live. */
+  peekRoom(roomId: string): TLSocketRoom<UnknownRecord, SessionMeta> | undefined {
+    return this.rooms.get(roomId)?.room
+  }
+
+  /** Drop one room from memory (DELETE /api/rooms/:id). The sync tables are
+   * already gone from SQLite; this just stops the live room + AI session. */
+  deleteRoom(roomId: string) {
+    const record = this.rooms.get(roomId)
+    if (!record) return
+    if (record.timer) clearTimeout(record.timer)
+    try {
+      record.room.close()
+    } catch (err) {
+      log.warn(`room ${roomId}: error closing sync room`, err)
+    }
+    this.rooms.delete(roomId)
+    this.hooks.onRoomDestroyed?.(roomId)
+  }
+
+  /** Number of live in-memory rooms (for /ready). */
+  get size(): number {
+    return this.rooms.size
+  }
+
+  /** Graceful shutdown: close every live room so nothing accepts writes after
+   * the DB checkpoints. Rooms persist per change, so close() is the flush. */
+  closeAll() {
+    for (const roomId of [...this.rooms.keys()]) this.deleteRoom(roomId)
   }
 }

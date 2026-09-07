@@ -1,23 +1,24 @@
 import express from 'express'
 import { createServer } from 'node:http'
+import { accessSync, constants } from 'node:fs'
 import path from 'node:path'
 import { WebSocketServer } from 'ws'
 import Database from 'better-sqlite3'
-import { DATA_DIR, getDb } from './db'
+import { DATA_DIR, PORT } from './config'
+import { getDb } from './db'
 import { log } from './log'
 import { createAssetsRouter } from './assets'
 import { createRoomsRouter, requireJoinToken } from './rooms'
 import { createMusicRouter } from './music'
-import { scanMusicDir } from './music/scanner'
+import { scanMusicDir, lastScanAt } from './music/scanner'
 import { RoomManager } from './sync'
 import { AgentService } from './ai/service'
 import { SessionManager } from './ai/sessions'
-import { AGENT_MODEL_DEFINITIONS, isValidModelName } from '../shared/agent/models'
+import { AGENT_MODEL_DEFINITIONS, compareProviderOrder, isValidModelName, resolveDefaultModelName } from '../shared/agent/models'
 import type { AgentModelProvider } from '../shared/agent/models'
 import type { UserInfo } from '../shared/types'
 import type { AiModelInfo } from '../shared/types'
 
-const PORT = Number(process.env.PORT ?? 3000)
 const app = express()
 const server = createServer(app)
 
@@ -90,7 +91,7 @@ wss.on('connection', (socket, req) => {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const match = url.pathname.match(/^\/sync\/([a-z0-9]+)$/)
   if (!match) {
-    socket.close(1008, 'bad room id')
+    socket.close(4099, 'NOT_FOUND')
     return
   }
   const roomId = match[1]!
@@ -99,11 +100,17 @@ wss.on('connection', (socket, req) => {
   // typo'd or hostile id must not materialize a phantom room, its sync tables,
   // or a headless AI session — and this is what surfaces as the "room not
   // found" error in the client.
+  //
+  // 4099 is tldraw's TLSyncErrorCloseEventCode: only this code puts the
+  // client's useSync into `error` with the reason as the message (any other
+  // code just looks like a dropped connection and retries forever). NOT_FOUND
+  // vs FORBIDDEN is what the client maps to its not-found / access-denied UI.
   const known = db.prepare('SELECT password_hash FROM rooms WHERE id = ?').get(roomId) as
     | { password_hash: string | null }
     | undefined
   if (!known) {
-    socket.close(1008, 'room not found')
+    log.warn(`room ${roomId}: WS rejected (NOT_FOUND)`)
+    socket.close(4099, 'NOT_FOUND')
     return
   }
 
@@ -111,7 +118,8 @@ wss.on('connection', (socket, req) => {
   // t2join cookie set by POST /api/rooms/:id/join). Public rooms need none.
   if (known.password_hash) {
     if (!requireJoinToken(roomId, readCookie(req.headers.cookie, 't2join'))) {
-      socket.close(1008, 'access denied')
+      log.warn(`room ${roomId}: WS rejected (FORBIDDEN)`)
+      socket.close(4099, 'FORBIDDEN')
       return
     }
   }
@@ -136,10 +144,32 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
 })
 
+// Liveness vs readiness: /api/health only proves the process answers; /ready
+// proves it can serve rooms (DB writable, music scanned, sessions counted).
+// Load balancers / compose `depends_on` should gate on this, not /api/health.
+app.get('/ready', (_req, res) => {
+  try {
+    db.prepare('SELECT 1 AS ok').get()
+    accessSync(DATA_DIR, constants.W_OK)
+  } catch {
+    res.status(503).json({ ready: false, db: 'error' })
+    return
+  }
+  const scannedAt = lastScanAt()
+  res.json({
+    ready: true,
+    db: 'ok',
+    scannedAt,
+    scanAgeMs: scannedAt === null ? null : Date.now() - scannedAt,
+    sessions: sessions.size,
+  })
+})
+
 // Models the server can run: the kit's model definitions for any provider whose
-// API key is configured, plus OPENAI_DEFAULT_MODEL as a fallback entry so the
-// picker is never empty. The session pre-validates the chosen promptModel and
-// falls back to DEFAULT_MODEL_NAME when it isn't a runnable definition.
+// API key is configured, ordered Google -> OpenAI-compatible -> Anthropic so the
+// picker defaults to the cheapest good setup. Includes defaultModel (the single
+// shared default) so the client never guesses: Gemini Flash with GOOGLE_API_KEY,
+// else a valid OPENAI_DEFAULT_MODEL, else gpt-5.4-mini.
 app.get('/api/ai/models', (_req, res) => {
   const configured: Record<AgentModelProvider, boolean> = {
     openai: !!process.env.OPENAI_API_KEY,
@@ -157,9 +187,16 @@ app.get('/api/ai/models', (_req, res) => {
   // Only expose a real defined model; an invalid env default (e.g. gpt-4o-mini)
   // must not pollute the picker or become the pre-selected entry.
   if (envDefault && isValidModelName(envDefault) && !models.some((m) => m.id === envDefault)) {
-    models.unshift({ id: envDefault, name: envDefault, provider: 'openai' })
+    try {
+      const def = (AGENT_MODEL_DEFINITIONS as Record<string, { provider: string; name: string }>)[envDefault]
+      models.push({ id: envDefault, name: def?.name ?? envDefault, provider: def?.provider ?? 'openai' })
+    } catch {
+      // ponytail: live-only ids are already runnable via /live; skip here
+    }
   }
-  res.json({ models })
+  models.sort((a, b) => compareProviderOrder(a.provider as AgentModelProvider, b.provider as AgentModelProvider))
+  const defaultModel = resolveDefaultModelName(process.env as Record<string, string | undefined>)
+  res.json({ models, defaultModel })
 })
 
 // Models each configured provider actually serves, fetched live at request
@@ -184,7 +221,11 @@ app.get('/api/ai/models/live', async (_req, res) => {
   for (const m of live) {
     if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.id, provider: m.provider, known: false, chat: m.chat })
   }
-  res.json({ models: [...byId.values()], liveFailed, authFailed })
+  const ordered = [...byId.values()].sort((a, b) =>
+    compareProviderOrder(a.provider as AgentModelProvider, b.provider as AgentModelProvider)
+  )
+  const defaultModel = resolveDefaultModelName(process.env as Record<string, string | undefined>)
+  res.json({ models: ordered, liveFailed, authFailed, defaultModel })
 })
 
 app.use(express.json())
@@ -197,9 +238,9 @@ app.use((err: unknown, _req: express.Request, res: express.Response, next: expre
   }
   next(err)
 })
-app.use(createRoomsRouter(db, userFromReq))
+app.use(createRoomsRouter(db, userFromReq, { onDeleted: (roomId) => rooms.deleteRoom(roomId) }))
 app.use(createAssetsRouter(db))
-app.use(createMusicRouter(db))
+app.use(createMusicRouter(db, { userFromReq, peekRoom: (roomId) => rooms.peekRoom(roomId) }))
 
 // User-facing AI cancel: aborts the in-flight provider stream and releases the
 // room's AI lock. Idempotent — unknown/empty rooms just return ok.
@@ -224,9 +265,17 @@ const sendIndex = (_req: express.Request, res: express.Response) => {
   res.setHeader('Cache-Control', 'no-cache')
   res.sendFile(path.join(webDist, 'index.html'))
 }
-// Final fallback: SPA entry for any unmatched GET.
+// Final fallback: SPA entry for any unmatched GET — except /media/*, where a
+// miss is a bad id/traversal probe, not a client route (it must 404, never
+// serve index.html with 200).
 app.use((req, res, next) => {
-  if (req.method === 'GET' || req.method === 'HEAD') return sendIndex(req, res)
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    if (req.path.startsWith('/media/')) {
+      res.status(404).json({ error: 'not found' })
+      return
+    }
+    return sendIndex(req, res)
+  }
   next()
 })
 
@@ -261,3 +310,53 @@ server.on('error', (err: NodeJS.ErrnoException) => {
   }
   throw err
 })
+
+// Graceful drain (single instance): stop accepting, close every WS client so
+// sync stops writing, drop the in-memory rooms (their AI sessions die with
+// them via onRoomDestroyed), WAL-checkpoint, then close the DB. Rooms persist
+// per change, so room.close() is the flush — nothing extra to write out.
+let shuttingDown = false
+function shutdown(signal: string) {
+  if (shuttingDown) return
+  shuttingDown = true
+  log.info(`received ${signal} — draining (${rooms.size} live room(s))`)
+  server.close(() => process.exit(0))
+  try {
+    wss.close()
+  } catch {
+    // already closed
+  }
+  for (const client of wss.clients) {
+    try {
+      client.close(1001, 'server shutting down')
+    } catch {
+      // best-effort
+    }
+  }
+  try {
+    rooms.closeAll()
+  } catch (err) {
+    log.error('error closing rooms during shutdown', err)
+  }
+  try {
+    sessions.stop()
+  } catch {
+    // belt-and-suspenders: closeAll already destroyed every live session
+  }
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)')
+  } catch (err) {
+    log.error('WAL checkpoint failed during shutdown', err)
+  }
+  try {
+    db.close()
+  } catch {
+    // best-effort
+  }
+  log.info('shutdown complete')
+  // Keep-alive sockets can hold server.close()'s callback forever; force the
+  // exit rather than hanging the container stop.
+  setTimeout(() => process.exit(0), 10_000).unref()
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))

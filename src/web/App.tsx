@@ -15,10 +15,12 @@ export function App() {
 
   const route = hash.replace(/^#/, '') || '/'
 
-  if (route.startsWith('/r/')) {
-    const roomId = route.slice(3)
-    if (roomId) return <Room roomId={roomId} />
-  }
-
-  return <Home />
+  return (
+    <>
+      <a className="skip-link" href="#main-content">
+        Skip to content
+      </a>
+      {route.startsWith('/r/') && route.slice(3) ? <Room roomId={route.slice(3)} /> : <Home />}
+    </>
+  )
 }

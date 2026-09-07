@@ -8,7 +8,18 @@ export const assetStore: TLAssetStore = {
     const form = new FormData()
     form.append('file', file)
     const res = await fetch('/api/assets', { method: 'POST', body: form })
-    if (!res.ok) throw new Error(`asset upload failed (${res.status})`)
+    // Surface the server's message ('file too large (max 50 MB)',
+    // 'SVG is not allowed', …) instead of a bare status code.
+    if (!res.ok) {
+      let message = `asset upload failed (${res.status})`
+      try {
+        const body = (await res.json()) as { error?: string }
+        if (body?.error) message = body.error
+      } catch {
+        // keep the default message
+      }
+      throw new Error(message)
+    }
     const { src } = (await res.json()) as { src: string }
     return { src }
   },

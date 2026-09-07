@@ -1,0 +1,151 @@
+/* --- from theme.css L1-91 --- */
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/Inter-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/Inter-Medium.ttf') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/Inter-SemiBold.ttf') format('truetype');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/Inter-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --bg: #2e2e2e;
+  --surface: #444444;
+  --border: #1c1c1c;
+  --text: #ffffff;
+  --muted: #888d91;
+  --accent: #6c4cf1;
+  --success: #099268;
+  --warning: #f1ac4b;
+  --danger: #e16919;
+
+  --font: 'Inter', system-ui, sans-serif;
+  /* ONE display face: system serif stack (no downloads) — hero + wordmark only. */
+  --font-display: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --radius: 10px;
+
+  /* type scale */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 21px;
+  --text-2xl: 28px;
+  --text-hero: clamp(40px, 7vw, 64px);
+
+  /* spacing scale — 4px grid */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-16: 64px;
+
+  /* z-index scale */
+  --z-backdrop: 10;
+  --z-panel: 999;
+  --z-chrome: 1000;
+  --z-menu: 1001;
+  --z-modal: 2001;
+
+  /* canvas + grid overlays — dark is the default theme */
+  --canvas-bg: #101011;
+  --grid-line: rgba(255, 255, 255, 0.16);
+  --grid-dot: rgba(255, 255, 255, 0.24);
+  --grid-size: 32px;
+}
+
+:root[data-theme='light'] {
+  --bg: #f2f3f5;
+  --surface: #ffffff;
+  --border: #d7dbdf;
+  --text: #1c1c1c;
+  --muted: #5b6067;
+  /* darker violet so white-on-accent + accent-on-white both clear 4.5:1 */
+  --accent: #5f3dc4;
+
+  --canvas-bg: #f9fafb;
+  --grid-line: rgba(0, 0, 0, 0.18);
+  --grid-dot: rgba(0, 0, 0, 0.24);
+  --grid-size: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.room {
+  position: fixed;
+  inset: 0;
+}
+
+.skip-link {
+  position: fixed;
+  top: -48px;
+  left: var(--space-4);
+  z-index: var(--z-modal);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  text-decoration: none;
+  transition: top 150ms ease;
+}
+
+.skip-link:focus-visible {
+  top: var(--space-2);
+  outline: 2px solid #fff;
+}
+
+/* --- from theme.css L1649-1657 --- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

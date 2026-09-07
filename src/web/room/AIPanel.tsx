@@ -1,18 +1,25 @@
-import { memo, useEffect, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { Suspense, lazy, memo, useEffect, useRef, useState } from 'react'
 import type { Components } from 'react-markdown'
 import type { Editor } from 'tldraw'
 import { useValue } from 'tldraw'
-import { AI_STATE_ID, createDefaultAiState } from '../../shared/schema'
-import type { AiState } from '../../shared/schema'
+import { AI_STATE_ID, MAX_AI_QUEUE_LENGTH, createDefaultAiState } from '../../shared/schema'
+import type { AiQueuedPrompt, AiState } from '../../shared/schema'
 import type { AiModelInfo, AiModelsResponse } from '../../shared/types'
 import { useUser } from '../lib/user'
 import { api } from '../lib/api'
-import { getAiContext } from './aiContext'
+import { captureViewportScreenshot, getAiContext } from './aiContext'
 import { usePanelSlide } from '../lib/usePanelSlide'
+import { useFocusTrap } from '../lib/useFocusTrap'
+
+// react-markdown is the heaviest dep on this path — split it so the panel
+// shell (and the room) paint before the parser arrives.
+const ReactMarkdown = lazy(() => import('react-markdown'))
 
 const MODEL_KEY = 't2.aiModel'
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+const SHOT_KEY = 't2.aiScreenshot'
+// Single shared default (server advertises its own via defaultModel; this is
+// only the pre-fetch fallback): Google-first.
+const DEFAULT_MODEL = 'gemini-3.5-flash'
 
 const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
@@ -109,7 +116,9 @@ const ChatMessage = memo(function ChatMessage({
           <span className="ai-msg-time">{timeAgo(ts)}</span>
         </div>
         <div className="ai-msg-body">
-          <ReactMarkdown components={markdownComponents}>{content}</ReactMarkdown>
+          <Suspense fallback={<p>{content}</p>}>
+            <ReactMarkdown components={markdownComponents}>{content}</ReactMarkdown>
+          </Suspense>
         </div>
       </div>
     </div>
@@ -131,6 +140,9 @@ export function AIPanel({
   const me = useUser()
   const panelRef = useRef<HTMLDivElement>(null)
   usePanelSlide(panelRef, 'left', open)
+  // Focus trap matches the share modal: Escape closes, Tab wraps, focus
+  // returns to the toggle when the panel closes.
+  useFocusTrap(panelRef, open, onClose)
   // ponytail: aiState is validated by the schema at the sync boundary; the
   // store's branded RecordId types don't know our custom records, so cast here.
   const getAi = () => store.get(AI_STATE_ID as any) as AiState | undefined
@@ -139,7 +151,10 @@ export function AIPanel({
   const [models, setModels] = useState<AiModelInfo[]>([])
   const [modelsFailed, setModelsFailed] = useState(false)
   const [model, setModel] = useState(() => localStorage.getItem(MODEL_KEY) ?? '')
+  const [serverDefault, setServerDefault] = useState(DEFAULT_MODEL)
   const [input, setInput] = useState('')
+  const [includeShot, setIncludeShot] = useState(() => localStorage.getItem(SHOT_KEY) === '1')
+  const [resumeText, setResumeText] = useState<string | null>(null)
   // Re-render periodically so relative timestamps ("5m ago") keep advancing.
   const [tick, setTick] = useState(0)
   useEffect(() => {
@@ -155,19 +170,21 @@ export function AIPanel({
 
   useEffect(() => {
     let cancelled = false
-    const apply = (list: AiModelInfo[]) => {
+    const apply = (list: AiModelInfo[], fallback?: string) => {
       if (cancelled) return
       setModels(list)
-      // a persisted id that is now chat:false (e.g. embeddings after a filter
-      // fix) must fall back — it would render as a selected-but-disabled option
-      setModel((prev) => (list.some((m) => m.id === prev && m.chat !== false) ? prev : list.find((m) => m.chat !== false)?.id || DEFAULT_MODEL))
+      if (fallback) setServerDefault(fallback)
+      // Prefer the server's shared default over models[0]: the picker and the
+      // runner agree, and a persisted id that is now chat:false still falls back.
+      const want = fallback ?? list.find((m) => m.chat !== false)?.id ?? DEFAULT_MODEL
+      setModel((prev) => (list.some((m) => m.id === prev && m.chat !== false) ? prev : want))
     }
     api<AiModelsResponse>('/api/ai/models/live')
-      .then((res) => apply(res.models))
+      .then((res) => apply(res.models, res.defaultModel))
       .catch(() => {
         // Live list unavailable: fall back to the static endpoint behavior.
         api<AiModelsResponse>('/api/ai/models')
-          .then((res) => apply(res.models))
+          .then((res) => apply(res.models, res.defaultModel))
           .catch(() => {
             if (!cancelled) {
               setModels([])
@@ -181,6 +198,10 @@ export function AIPanel({
   useEffect(() => {
     if (model) localStorage.setItem(MODEL_KEY, model)
   }, [model])
+
+  useEffect(() => {
+    localStorage.setItem(SHOT_KEY, includeShot ? '1' : '0')
+  }, [includeShot])
 
   useEffect(() => {
     if (!store.get(AI_STATE_ID as any)) putAi(createDefaultAiState())
@@ -198,21 +219,24 @@ export function AIPanel({
   }, [aiState?.conversation, aiState?.streamingText, open])
 
   const conversation = aiState?.conversation ?? []
+  const queue: AiQueuedPrompt[] = Array.isArray((aiState as any)?.queue) ? ((aiState as any).queue as AiQueuedPrompt[]) : []
   const running = aiState?.status === 'pending' || aiState?.status === 'running'
-  const lockedByMe = !!aiState?.lockedBy && aiState.lockedBy === me.id
-  const lockedByOther = !!aiState?.lockedBy && aiState.lockedBy !== me.id
-  const canSubmit = !running && !lockedByOther
+  const queueFull = queue.length >= MAX_AI_QUEUE_LENGTH
+  // Queueing stays open while running — submits append instead of overwriting.
+  const canSubmit = !queueFull
 
   const modelsUnavailable = modelsFailed && models.length === 0
   const modelName = modelsUnavailable
     ? 'models unavailable'
-    : models.find((m) => m.id === model)?.name ?? (model || DEFAULT_MODEL)
+    : models.find((m) => m.id === model)?.name ?? (model || serverDefault)
   const statusLine = aiState?.error
     ? 'Error'
     : running
-      ? 'thinking…'
-      : lockedByOther
-        ? 'busy'
+      ? queue.length > 0
+        ? `thinking… +${queue.length} queued`
+        : 'thinking…'
+      : queue.length > 0
+        ? `${queue.length} queued`
         : 'ready'
 
   function tsFor(i: number): number {
@@ -220,41 +244,92 @@ export function AIPanel({
     return tsByIndex.current[i]!
   }
 
-  function submit() {
-    const text = input.trim()
-    if (!text || !canSubmit) return
+  async function enqueue(textOverride?: string) {
+    const text = (textOverride ?? input).trim()
+    if (!text || queueFull) return
     const ctx = getAiContext(editor)
+    const screenshot = includeShot ? await captureViewportScreenshot(editor) : null
     const cur = getAi() ?? createDefaultAiState()
-    putAi({
-      ...cur,
-      lockedBy: me.id,
-      lockedByName: me.name,
-      status: 'pending',
-      streamingText: '',
-      error: null,
-      conversation: [...cur.conversation, { role: 'user' as const, content: text, name: me.name, color: me.color }],
+    const curQueue: AiQueuedPrompt[] = Array.isArray((cur as any).queue) ? [...(cur as any).queue] : []
+    if (curQueue.length >= MAX_AI_QUEUE_LENGTH) return
+    const item: AiQueuedPrompt = {
+      id: crypto.randomUUID(),
       prompt: text,
       promptModel: model || null,
       promptSelection: ctx.selection,
       promptViewport: ctx.viewport,
-    })
-    setInput('')
+      includeScreenshot: includeShot,
+      ...(screenshot ? { screenshot } : {}),
+      by: me.id,
+      byName: me.name,
+      byColor: me.color,
+      queuedAt: Date.now(),
+    }
+    curQueue.push(item)
+    const nextConversation = [...cur.conversation, { role: 'user' as const, content: text, name: me.name, color: me.color }].slice(-50)
+    if (cur.status === 'idle' || cur.status === 'error') {
+      putAi({
+        ...cur,
+        lockedBy: me.id,
+        lockedByName: me.name,
+        status: 'pending',
+        streamingText: '',
+        error: null,
+        conversation: nextConversation,
+        prompt: null,
+        promptModel: null,
+        promptSelection: null,
+        promptViewport: null,
+        queue: curQueue,
+      })
+    } else {
+      // Single-flight executor keeps running; this just appends in order.
+      putAi({ ...cur, status: 'pending', conversation: nextConversation, queue: curQueue })
+    }
+    setResumeText(null)
+    if (textOverride === undefined) setInput('')
+  }
+
+  function submit() {
+    void enqueue()
+  }
+
+  function lastUserText(): string | null {
+    for (let i = conversation.length - 1; i >= 0; i--) {
+      if (conversation[i]!.role === 'user') return conversation[i]!.content
+    }
+    return null
+  }
+
+  function retry() {
+    const text = lastUserText()
+    if (text) void enqueue(text)
+  }
+
+  function resume() {
+    const text = resumeText ?? lastUserText()
+    if (text) void enqueue(text)
   }
 
   async function stop() {
+    const text = lastUserText()
+    if (text) setResumeText(text)
     try {
       await api(`/api/rooms/${roomId}/ai/cancel`, { method: 'POST' })
       const cur = getAi()
-      if (cur) putAi({ ...cur, status: 'idle', error: null, streamingText: '', lockedBy: null, lockedByName: null })
+      if (cur) putAi({ ...cur, status: 'idle', error: null, streamingText: '', lockedBy: null, lockedByName: null, prompt: null, promptModel: null, promptSelection: null, promptViewport: null })
     } catch (error) {
       console.error('[ai] cancel request failed:', error)
     }
   }
 
   function clearConversation() {
+    // Explicit: clearing wipes the shared history + pending queue for everyone.
+    if (!window.confirm('Clear the AI conversation and pending queue for everyone in this room?')) return
     tsByIndex.current = []
+    setResumeText(null)
     const cur = getAi()
-    if (cur) putAi({ ...cur, conversation: [], streamingText: '' })
+    if (cur) putAi({ ...cur, conversation: [], streamingText: '', error: null, status: 'idle', lockedBy: null, lockedByName: null, prompt: null, promptModel: null, promptSelection: null, promptViewport: null, queue: [] })
   }
 
   function useSuggestion(text: string) {
@@ -264,17 +339,21 @@ export function AIPanel({
 
   const footerStatus = aiState?.error
     ? 'Error: ' + aiState.error
-    : lockedByOther
-      ? `${aiState?.lockedByName ?? 'Someone'} is using the AI…`
-      : ''
+    : queueFull
+      ? `Queue is full (${MAX_AI_QUEUE_LENGTH}). Wait for a run to finish.`
+      : running && queue.length > 0
+        ? `${queue.length} prompt${queue.length === 1 ? '' : 's'} waiting behind this run.`
+        : ''
+
+  const showResume = !running && !aiState?.error && !!resumeText && conversation.length > 0
 
   return (
-    <aside className="ai-panel" ref={panelRef}>
+    <aside className="ai-panel" ref={panelRef} aria-label="AI assistant" tabIndex={-1}>
       <div className="ai-panel-header">
         <div className="ai-panel-title">
           <span className="ai-panel-name">AI assistant</span>
           <div className="ai-title-actions">
-            <button className="ai-clear" onClick={clearConversation} disabled={running || conversation.length === 0}>
+            <button className="ai-clear" onClick={clearConversation} disabled={conversation.length === 0 && queue.length === 0} title="Clear the conversation and pending queue for everyone">
               Clear
             </button>
             <button className="ai-close" onClick={onClose} title="Close" aria-label="Close">
@@ -315,7 +394,18 @@ export function AIPanel({
         </div>
       </div>
 
-      <div className="ai-chat" ref={chatRef}>
+      <div className="ai-chat" ref={chatRef} role="log" aria-live="polite" aria-label="AI conversation">
+        {queue.length > 0 && (
+          <div className="ai-queue" aria-label="Pending prompts">
+            {queue.map((q, i) => (
+              <span key={q.id} className={`ai-queue-chip${q.by === me.id ? ' ai-queue-mine' : ''}`} title={`${q.byName ?? 'Someone'} · ${q.prompt}`}>
+                <span className="ai-queue-pos">#{i + 1}</span>
+                <span className="ai-queue-who">{q.by === me.id ? 'you' : (q.byName ?? 'guest')}</span>
+                <span className="ai-queue-text">{q.prompt.slice(0, 40)}{q.prompt.length > 40 ? '…' : ''}</span>
+              </span>
+            ))}
+          </div>
+        )}
         {conversation.map((m, i) => (
           <ChatMessage key={i} role={m.role} content={m.content} name={m.name} color={m.color} ts={tsFor(i)} tick={tick} />
         ))}
@@ -330,7 +420,9 @@ export function AIPanel({
                 <span className="ai-msg-time">typing…</span>
               </div>
               <div className="ai-msg-body">
-                <ReactMarkdown components={markdownComponents}>{aiState?.streamingText || '…'}</ReactMarkdown>
+                <Suspense fallback={<p>{aiState?.streamingText || '…'}</p>}>
+                  <ReactMarkdown components={markdownComponents}>{aiState?.streamingText || '…'}</ReactMarkdown>
+                </Suspense>
               </div>
             </div>
           </div>
@@ -353,16 +445,33 @@ export function AIPanel({
         )}
       </div>
 
-      {footerStatus && <div className={`ai-status${aiState?.error ? ' ai-status-error' : ''}`}>{footerStatus}</div>}
+      {aiState?.error && (
+        <div className="ai-error" role="alert">
+          <span className="ai-error-text">That run failed — nothing on the board changed.</span>
+          <button className="ai-retry" onClick={retry} disabled={queueFull}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {footerStatus && !aiState?.error && <div className="ai-status">{footerStatus}</div>}
 
       <div className="ai-footer">
+        <label className="ai-shot">
+          <input
+            type="checkbox"
+            checked={includeShot}
+            onChange={(e) => setIncludeShot(e.target.checked)}
+          />
+          Attach screenshot
+        </label>
         <div className="ai-row">
           <textarea
             ref={promptRef}
             className="ai-input ai-prompt"
             rows={2}
             value={input}
-            placeholder={lockedByOther ? 'The AI is busy…' : 'Message the AI…'}
+            placeholder={queueFull ? `Queue full — wait for a run to finish…` : running ? 'Queue another prompt…' : 'Message the AI…'}
             disabled={!canSubmit}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -376,6 +485,10 @@ export function AIPanel({
           {running ? (
             <button className="ai-send ai-stop" onClick={stop} disabled={!running}>
               Stop
+            </button>
+          ) : showResume ? (
+            <button className="ai-send ai-resume" onClick={resume} title="Re-send the stopped prompt">
+              Resume
             </button>
           ) : (
             <button className="ai-send" onClick={submit} disabled={!canSubmit || !input.trim()}>

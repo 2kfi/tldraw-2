@@ -1,4 +1,4 @@
-import { AgentModelName, DEFAULT_MODEL_NAME, isValidModelName } from '../../../shared/agent/models'
+import { AgentModelName, isValidModelName, resolveDefaultModelName } from '../../../shared/agent/models'
 import { AgentPrompt } from '../../../shared/agent/types/AgentPrompt'
 import { getPromptPartDefinition } from '../../../shared/agent/types/PromptPart'
 
@@ -19,5 +19,5 @@ export function getModelName(prompt: AgentPrompt): AgentModelName {
 		}
 	}
 
-	return DEFAULT_MODEL_NAME
+	return resolveDefaultModelName(process.env as Record<string, string | undefined>)
 }
