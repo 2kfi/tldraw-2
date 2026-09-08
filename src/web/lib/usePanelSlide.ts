@@ -67,11 +67,14 @@ export function usePanelSlide(
       return
     }
     // Sync pre-set: gsap arrives async, so pin the closed state with plain
-    // styles until the timeline takes over (fromTo starts from the same spot).
+    // styles until the timeline takes over. Opacity/visibility only — never
+    // touch transform here: GSAP parses the computed matrix into pixel x/y on
+    // first contact, so a plain translateX(-100%) would bake in as x=-340px
+    // and the later xPercent tween (which leaves x alone) could never undo
+    // it — the panel would sit open-but-off-screen forever.
     if (!tlRef.current && !open) {
       el.style.opacity = '0'
       el.style.visibility = 'hidden'
-      el.style.transform = `translateX(${dir}%)`
     }
     let cancelled = false
     loadGsap().then((gsap) => {
